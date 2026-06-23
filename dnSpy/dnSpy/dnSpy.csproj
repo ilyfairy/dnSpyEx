@@ -29,6 +29,10 @@
     <RuntimeHostConfigurationOption Include="Switch.System.Windows.Media.EnableHardwareAccelerationInRdp" Value="true" />
   </ItemGroup>
 
+  <ItemGroup Condition=" '$(IsDotNet)' == 'true' ">
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
   <PropertyGroup>
     <ApplicationIcon>Images\dnSpy.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>

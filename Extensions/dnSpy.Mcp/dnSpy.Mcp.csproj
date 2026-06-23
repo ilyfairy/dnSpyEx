@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+
+  <Import Project="..\..\DnSpyCommon.props" />
+
+  <PropertyGroup>
+    <TargetFrameworks>net10.0-windows</TargetFrameworks>
+    <AssemblyName>dnSpy.Mcp.x</AssemblyName>
+    <Version>$(DnSpyAssemblyVersion)</Version>
+    <InformationalVersion>$(DnSpyAssemblyInformationalVersion)</InformationalVersion>
+    <SignAssembly>True</SignAssembly>
+    <AssemblyOriginatorKeyFile>..\..\dnSpy.snk</AssemblyOriginatorKeyFile>
+    <OutputPath>..\..\dnSpy\dnSpy\bin\$(Configuration)\</OutputPath>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.DnSpy\dnSpy.Contracts.DnSpy.csproj" />
+    <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Debugger\dnSpy.Contracts.Debugger.csproj" />
+    <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Debugger.DotNet\dnSpy.Contracts.Debugger.DotNet.csproj" />
+    <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Debugger.DotNet.CorDebug\dnSpy.Contracts.Debugger.DotNet.CorDebug.csproj" />
+    <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Debugger.DotNet.Mono\dnSpy.Contracts.Debugger.DotNet.Mono.csproj" />
+    <ProjectReference Include="..\..\dnSpy\dnSpy.Contracts.Logic\dnSpy.Contracts.Logic.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.1.0" />
+  </ItemGroup>
+
+</Project>
