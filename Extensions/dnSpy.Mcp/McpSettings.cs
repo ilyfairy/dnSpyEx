@@ -43,6 +43,18 @@ namespace dnSpy.Mcp {
 		}
 		string routePath = "/mcp";
 
+		public string BearerToken {
+			get => bearerToken;
+			set {
+				value ??= string.Empty;
+				if (bearerToken != value) {
+					bearerToken = value;
+					OnPropertyChanged(nameof(BearerToken));
+				}
+			}
+		}
+		string bearerToken = string.Empty;
+
 		public string EnabledToolNamesText {
 			get => enabledToolNamesText;
 			set {
@@ -78,6 +90,7 @@ namespace dnSpy.Mcp {
 			other.ListenAddress = ListenAddress;
 			other.Port = Port;
 			other.RoutePath = RoutePath;
+			other.BearerToken = BearerToken;
 			other.EnabledToolNamesText = EnabledToolNamesText;
 			return other;
 		}
@@ -97,6 +110,7 @@ namespace dnSpy.Mcp {
 			ListenAddress = section.Attribute<string>(nameof(ListenAddress)) ?? ListenAddress;
 			Port = section.Attribute<int?>(nameof(Port)) ?? Port;
 			RoutePath = section.Attribute<string>(nameof(RoutePath)) ?? RoutePath;
+			BearerToken = section.Attribute<string>(nameof(BearerToken)) ?? BearerToken;
 			EnabledToolNamesText = section.Attribute<string>(nameof(EnabledToolNamesText)) ?? EnabledToolNamesText;
 			PropertyChanged += McpSettingsImpl_PropertyChanged;
 		}
@@ -106,6 +120,7 @@ namespace dnSpy.Mcp {
 			section.Attribute(nameof(ListenAddress), ListenAddress);
 			section.Attribute(nameof(Port), Port);
 			section.Attribute(nameof(RoutePath), RoutePath);
+			section.Attribute(nameof(BearerToken), BearerToken);
 			section.Attribute(nameof(EnabledToolNamesText), EnabledToolNamesText);
 		}
 	}

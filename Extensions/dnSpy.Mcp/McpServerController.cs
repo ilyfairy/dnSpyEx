@@ -18,11 +18,11 @@ using dnSpy.Contracts.Decompiler;
 using dnSpy.Contracts.Documents;
 using dnSpy.Contracts.Documents.Tabs;
 using dnSpy.Contracts.Documents.TreeView;
-using dnSpy.Contracts.Settings;
 using dnSpy.Contracts.Scripting;
 using dnSpy.Contracts.ToolWindows.App;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
@@ -60,7 +60,6 @@ namespace dnSpy.Mcp {
 		readonly IDocumentTabService documentTabService;
 		readonly IDecompilerService decompilerService;
 		readonly ILanguageCompilerProvider[] languageCompilerProviders;
-		readonly ISettingsService settingsService;
 		readonly IServiceLocator serviceLocator;
 
 		WebApplication? webApplication;
@@ -74,7 +73,7 @@ namespace dnSpy.Mcp {
 		readonly List<McpDebugEventEntry> debugEvents;
 
 		[ImportingConstructor]
-		McpServerController(IAppWindow appWindow, IDsToolWindowService toolWindowService, McpSettings mcpSettings, McpOutputLogger logger, DbgManager dbgManager, DbgCodeBreakpointsService dbgCodeBreakpointsService, DbgCodeBreakpointHitCountService dbgCodeBreakpointHitCountService, DbgCallStackService dbgCallStackService, AttachableProcessesService attachableProcessesService, DbgLanguageService dbgLanguageService, DbgDotNetBreakpointFactory dbgDotNetBreakpointFactory, DbgExceptionSettingsService dbgExceptionSettingsService, IDsDocumentService documentService, IDocumentTreeView documentTreeView, IDocumentTabService documentTabService, IDecompilerService decompilerService, [ImportMany] IEnumerable<ILanguageCompilerProvider> languageCompilerProviders, ISettingsService settingsService, IServiceLocator serviceLocator) {
+		McpServerController(IAppWindow appWindow, IDsToolWindowService toolWindowService, McpSettings mcpSettings, McpOutputLogger logger, DbgManager dbgManager, DbgCodeBreakpointsService dbgCodeBreakpointsService, DbgCodeBreakpointHitCountService dbgCodeBreakpointHitCountService, DbgCallStackService dbgCallStackService, AttachableProcessesService attachableProcessesService, DbgLanguageService dbgLanguageService, DbgDotNetBreakpointFactory dbgDotNetBreakpointFactory, DbgExceptionSettingsService dbgExceptionSettingsService, IDsDocumentService documentService, IDocumentTreeView documentTreeView, IDocumentTabService documentTabService, IDecompilerService decompilerService, [ImportMany] IEnumerable<ILanguageCompilerProvider> languageCompilerProviders, IServiceLocator serviceLocator) {
 			lockObj = new object();
 			debugEventLockObj = new object();
 			this.appWindow = appWindow;
@@ -94,7 +93,6 @@ namespace dnSpy.Mcp {
 			this.documentTabService = documentTabService;
 			this.decompilerService = decompilerService;
 			this.languageCompilerProviders = languageCompilerProviders.ToArray();
-			this.settingsService = settingsService;
 			this.serviceLocator = serviceLocator;
 			debugEvents = new List<McpDebugEventEntry>();
 			state = McpServerState.Stopped;
@@ -125,6 +123,7 @@ namespace dnSpy.Mcp {
 		public bool IsBusy => State == McpServerState.Starting || State == McpServerState.Stopping;
 		public bool CanToggle => !IsBusy;
 		public string EndpointUrl => GetEndpointUrl();
+		public McpSettings Settings => mcpSettings;
 
 		public void ToggleAsync() {
 			ShowOutput();
@@ -574,7 +573,12 @@ namespace dnSpy.Mcp {
 				Args = Array.Empty<string>(),
 			});
 
-			builder.WebHost.UseUrls($"http://{FormatListenAddressForUrl(NormalizeListenAddress(mcpSettings.ListenAddress))}:{NormalizePort(mcpSettings.Port)}");
+			var listenAddress = NormalizeListenAddress(mcpSettings.ListenAddress);
+			var port = NormalizePort(mcpSettings.Port);
+			var routePath = NormalizeRoutePath(mcpSettings.RoutePath);
+			var bearerToken = mcpSettings.BearerToken;
+
+			builder.WebHost.UseUrls($"http://{FormatListenAddressForUrl(listenAddress)}:{port}");
 			builder.Logging.ClearProviders();
 
 			builder.Services.AddSingleton(mcpSettings);
@@ -591,7 +595,6 @@ namespace dnSpy.Mcp {
 			builder.Services.AddSingleton(documentTabService);
 			builder.Services.AddSingleton(decompilerService);
 			builder.Services.AddSingleton<IEnumerable<ILanguageCompilerProvider>>(languageCompilerProviders);
-			builder.Services.AddSingleton(settingsService);
 			builder.Services.AddSingleton(serviceLocator);
 			builder.Services.AddSingleton(logger);
 			builder.Services.AddSingleton(this);
@@ -605,8 +608,28 @@ namespace dnSpy.Mcp {
 			mcpServerBuilder.WithTools(CreateEnabledTools());
 
 			var app = builder.Build();
-			app.MapMcp(NormalizeRoutePath(mcpSettings.RoutePath));
+			app.Use(async (context, next) => {
+				if (IsAuthRequiredFor(context, routePath, bearerToken) && !HasValidAuthorization(context, bearerToken))
+					return;
+				await next(context).ConfigureAwait(false);
+			});
+			app.MapMcp(routePath);
 			return app;
+		}
+
+		static bool IsAuthRequiredFor(HttpContext context, string routePath, string bearerToken) =>
+			!string.IsNullOrEmpty(bearerToken) && context.Request.Path.StartsWithSegments(routePath, StringComparison.OrdinalIgnoreCase);
+
+		static bool HasValidAuthorization(HttpContext context, string bearerToken) {
+			const string bearerPrefix = "Bearer ";
+			var authorization = context.Request.Headers.Authorization.ToString();
+			if (authorization.StartsWith(bearerPrefix, StringComparison.OrdinalIgnoreCase) &&
+				string.Equals(authorization.Substring(bearerPrefix.Length), bearerToken, StringComparison.Ordinal)) {
+				return true;
+			}
+			context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+			context.Response.Headers.WWWAuthenticate = "Bearer";
+			return false;
 		}
 
 		IEnumerable<McpServerTool> CreateEnabledTools() =>
@@ -635,7 +658,6 @@ namespace dnSpy.Mcp {
 					documentTabService,
 					decompilerService,
 					languageCompilerProviders,
-					settingsService,
 					serviceLocator)));
 	}
 

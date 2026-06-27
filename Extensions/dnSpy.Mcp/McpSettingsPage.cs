@@ -28,6 +28,7 @@ namespace dnSpy.Mcp {
 		TextBox? listenAddressTextBox;
 		TextBox? portTextBox;
 		TextBox? routeTextBox;
+		TextBox? tokenTextBox;
 		FrameworkElement? uiObject;
 
 		public override Guid ParentGuid => Guid.Empty;
@@ -64,6 +65,9 @@ namespace dnSpy.Mcp {
 			else
 				newSettings.RoutePath = McpServerController.NormalizeRoutePath(newSettings.RoutePath);
 
+			if (tokenTextBox is not null)
+				newSettings.BearerToken = tokenTextBox.Text;
+
 			if (toolCheckBoxes.Count != 0) {
 				newSettings.SetEnabledToolNames(toolCheckBoxes.Where(a => a.Value.IsChecked == true).Select(a => a.Key));
 			}
@@ -82,6 +86,10 @@ namespace dnSpy.Mcp {
 			};
 			routeTextBox = new TextBox {
 				Text = McpServerController.NormalizeRoutePath(newSettings.RoutePath),
+				MinWidth = 220,
+			};
+			tokenTextBox = new TextBox {
+				Text = newSettings.BearerToken,
 				MinWidth = 220,
 			};
 
@@ -103,9 +111,10 @@ namespace dnSpy.Mcp {
 			panel.Children.Add(CreateRow("Listen address", listenAddressTextBox));
 			panel.Children.Add(CreateRow("Port", portTextBox));
 			panel.Children.Add(CreateRow("Route", routeTextBox));
+			panel.Children.Add(CreateRow("Bearer token", tokenTextBox));
 			panel.Children.Add(CreateToolEnablementSection());
 			panel.Children.Add(new TextBlock {
-				Text = "Endpoint and tool enablement changes take effect after restarting the MCP server.",
+				Text = "Endpoint, bearer token, and tool enablement changes take effect after restarting the MCP server. Empty token disables HTTP authentication.",
 				Margin = new Thickness(0, 12, 0, 0),
 				TextWrapping = TextWrapping.Wrap,
 			});

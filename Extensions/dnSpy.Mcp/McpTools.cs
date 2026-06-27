@@ -34,7 +34,6 @@ using dnSpy.Contracts.Decompiler;
 using dnSpy.Contracts.Documents;
 using dnSpy.Contracts.Documents.Tabs;
 using dnSpy.Contracts.Metadata;
-using dnSpy.Contracts.Settings;
 using dnSpy.Contracts.Scripting;
 using dnSpy.Contracts.Documents.TreeView;
 using ModelContextProtocol.Server;
@@ -57,7 +56,6 @@ namespace dnSpy.Mcp {
 		readonly IDocumentTabService documentTabService;
 		readonly IDecompilerService decompilerService;
 		readonly ILanguageCompilerProvider[] languageCompilerProviders;
-		readonly ISettingsService settingsService;
 		readonly IServiceLocator serviceLocator;
 		static int nextToolCallId;
 		static readonly object debugModulesCacheLock = new object();
@@ -65,7 +63,7 @@ namespace dnSpy.Mcp {
 		static DateTime lastDebugModulesCacheUtc;
 		static DebugModuleInfo[]? lastDebugModulesCacheValue;
 
-		public DnSpyMcpTools(McpServerController mcpServerController, McpOutputLogger logger, DbgManager dbgManager, DbgCodeBreakpointsService dbgCodeBreakpointsService, DbgCodeBreakpointHitCountService dbgCodeBreakpointHitCountService, DbgCallStackService dbgCallStackService, AttachableProcessesService attachableProcessesService, DbgLanguageService dbgLanguageService, DbgDotNetBreakpointFactory dbgDotNetBreakpointFactory, DbgExceptionSettingsService dbgExceptionSettingsService, IDsDocumentService documentService, IDocumentTreeView documentTreeView, IDocumentTabService documentTabService, IDecompilerService decompilerService, IEnumerable<ILanguageCompilerProvider> languageCompilerProviders, ISettingsService settingsService, IServiceLocator serviceLocator) {
+		public DnSpyMcpTools(McpServerController mcpServerController, McpOutputLogger logger, DbgManager dbgManager, DbgCodeBreakpointsService dbgCodeBreakpointsService, DbgCodeBreakpointHitCountService dbgCodeBreakpointHitCountService, DbgCallStackService dbgCallStackService, AttachableProcessesService attachableProcessesService, DbgLanguageService dbgLanguageService, DbgDotNetBreakpointFactory dbgDotNetBreakpointFactory, DbgExceptionSettingsService dbgExceptionSettingsService, IDsDocumentService documentService, IDocumentTreeView documentTreeView, IDocumentTabService documentTabService, IDecompilerService decompilerService, IEnumerable<ILanguageCompilerProvider> languageCompilerProviders, IServiceLocator serviceLocator) {
 			this.mcpServerController = mcpServerController;
 			this.logger = logger;
 			this.dbgManager = dbgManager;
@@ -81,9 +79,42 @@ namespace dnSpy.Mcp {
 			this.documentTabService = documentTabService;
 			this.decompilerService = decompilerService;
 			this.languageCompilerProviders = languageCompilerProviders.OrderBy(a => a.Order).ToArray();
-			this.settingsService = settingsService;
 			this.serviceLocator = serviceLocator;
 		}
+
+		[McpServerTool(Name = "get_mcp_context"), Description("Returns the current AI-friendly dnSpyEx MCP context: loaded documents, default decompiler, debugger status, recent debugger events, and suggested next tools.")]
+		public McpContextResult GetMcpContext(
+			[Description("Maximum loaded documents to include.")] int maxDocuments = 20,
+			[Description("Maximum recent debugger events to include.")] int maxEvents = 20) => LoggedCall("get_mcp_context", string.Empty, () => {
+				var documents = documentService.GetDocuments()
+					.Take(Math.Max(1, maxDocuments))
+					.Select(ToLoadedDocumentInfo)
+					.ToArray();
+				var defaultDecompiler = decompilerService.Decompiler;
+				var currentProcess = dbgManager.CurrentProcess.Current;
+				var currentThread = dbgManager.CurrentThread.Current;
+				var activeFrame = dbgCallStackService.ActiveFrame;
+				var debugStatus = new DebugSessionStatusResult(
+					dbgManager.IsDebugging,
+					dbgManager.IsRunning,
+					dbgManager.Processes.Length,
+					currentProcess is null ? null : ToDebugProcessInfo(currentProcess),
+					currentThread is null ? null : ToDebugThreadInfo(currentThread),
+					activeFrame is null ? null : ToCallStackFrameInfo(activeFrame),
+					dbgCallStackService.ActiveFrameIndex,
+					dbgCallStackService.Frames.Frames.Count,
+					dbgCallStackService.Frames.FramesTruncated);
+				var recentEvents = mcpServerController.GetRecentDebugEvents(maxResults: Math.Max(1, maxEvents))
+					.Select(ToDebugEventInfo)
+					.ToArray();
+				return new McpContextResult(
+					documents,
+					new DecompilerInfo(defaultDecompiler.UniqueNameUI, defaultDecompiler.GenericNameUI, defaultDecompiler.FileExtension, defaultDecompiler.UniqueGuid.ToString(), true),
+					debugStatus,
+					recentEvents,
+					recentEvents.Length == 0 ? 0 : recentEvents.Max(a => a.Sequence),
+					CreateSuggestedNextTools(documents, debugStatus, recentEvents).Where(mcpServerController.Settings.IsToolEnabled).ToArray());
+			});
 
 		[McpServerTool(Name = "list_loaded_assemblies"), Description("Lists the assemblies and modules currently loaded in dnSpyEx.")]
 		public LoadedDocumentInfo[] ListLoadedAssemblies() => LoggedCall("list_loaded_assemblies", string.Empty, () =>
@@ -1453,49 +1484,6 @@ namespace dnSpy.Mcp {
 						return results.ToArray();
 				}
 
-				return results.ToArray();
-			});
-
-		[McpServerTool(Name = "list_settings_sections"), Description("Lists persisted dnSpyEx settings sections.")]
-		public SettingsSectionInfo[] ListSettingsSections(
-			[Description("Optional substring filter matched against section path or name.")] string? filter = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedCall("list_settings_sections", filter ?? string.Empty, () => {
-				var normalizedFilter = NormalizeQuery(filter);
-				return EnumerateSectionInfos(settingsService.Sections, string.Empty, 0)
-					.Where(a => normalizedFilter is null || Contains(a.Path, normalizedFilter, false) || Contains(a.Name, normalizedFilter, false))
-					.Take(Math.Max(1, maxResults))
-					.ToArray();
-			});
-
-		[McpServerTool(Name = "get_settings_section"), Description("Reads a settings section and its children.")]
-		public SettingsSectionData GetSettingsSection(
-			[Description("Section path from list_settings_sections.")] string sectionPath,
-			[Description("Maximum recursion depth when returning child sections.")] int maxDepth = 3) => LoggedCall("get_settings_section", sectionPath, () => {
-				if (string.IsNullOrWhiteSpace(sectionPath))
-					throw new ArgumentException("Section path must not be empty.", nameof(sectionPath));
-				var section = ResolveSectionPath(sectionPath);
-				return ToSettingsSectionData(section, sectionPath, 0, Math.Max(0, maxDepth));
-			});
-
-		[McpServerTool(Name = "search_settings"), Description("Searches settings section paths, attribute names, and values.")]
-		public SettingsSearchResult[] SearchSettings(
-			[Description("Search text or regex pattern when useRegex=true.")] string query,
-			[Description("Whether the search should be case-sensitive.")] bool caseSensitive = false,
-			[Description("Whether query should be treated as a regular expression.")] bool useRegex = false,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedCall("search_settings", query, () => {
-				if (string.IsNullOrWhiteSpace(query))
-					throw new ArgumentException("Search query must not be empty.", nameof(query));
-				var regex = useRegex ? CreateRegex(query, caseSensitive) : null;
-				var results = new List<SettingsSearchResult>();
-				foreach (var item in EnumerateSettingsValues(settingsService.Sections, string.Empty)) {
-					if (!IsMatch(item.SectionPath, query, caseSensitive, regex) &&
-						!IsMatch(item.AttributeName, query, caseSensitive, regex) &&
-						!IsMatch(item.AttributeValue, query, caseSensitive, regex))
-						continue;
-					results.Add(item);
-					if (results.Count >= Math.Max(1, maxResults))
-						break;
-				}
 				return results.ToArray();
 			});
 
@@ -3811,6 +3799,27 @@ namespace dnSpy.Mcp {
 			return new DecompiledTextResult(result.Decompiler, result.Target, truncatedText, message, true);
 		}
 
+		static string[] CreateSuggestedNextTools(LoadedDocumentInfo[] documents, DebugSessionStatusResult debugStatus, DebugEventInfo[] recentEvents) {
+			var tools = new List<string>();
+			if (documents.Length == 0)
+				tools.Add("load_assembly");
+			else {
+				tools.AddRange(new[] { "search_symbols", "get_metadata_summary", "decompile_type", "decompile_method" });
+				if (documents.Length == 1)
+					tools.Add("list_types");
+			}
+			if (!debugStatus.IsDebugging)
+				tools.AddRange(new[] { "list_attachable_processes", "start_debugging" });
+			else if (debugStatus.IsRunning == true)
+				tools.AddRange(new[] { "wait_for_debug_event", "break_all" });
+			else {
+				tools.AddRange(new[] { "get_call_stack", "evaluate_expression", "step_over", "run_all" });
+				if (recentEvents.Any(a => string.Equals(a.Kind, "exception-thrown", StringComparison.OrdinalIgnoreCase)))
+					tools.Add("list_exception_settings");
+			}
+			return tools.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+		}
+
 		DebugEventInfo ToDebugEventInfo(McpDebugEventEntry entry) => new DebugEventInfo(entry.Sequence, entry.TimestampUtc, entry.Kind, entry.Severity, entry.Message, entry.IsOutputLine, entry.ProcessId, entry.ProcessName, entry.ProcessFilename, entry.RuntimeName, entry.ThreadId, entry.ModuleName, entry.ModuleFilename, entry.AppDomainName);
 
 		IEnumerable<DbgProcess> EnumerateProcesses(int? processId) {
@@ -4943,70 +4952,9 @@ namespace dnSpy.Mcp {
 				results.Add(result);
 		}
 
-		IEnumerable<SettingsSectionInfo> EnumerateSectionInfos(ISettingsSection[] sections, string parentPath, int depth) {
-			var counters = new Dictionary<string, int>(StringComparer.Ordinal);
-			foreach (var section in sections) {
-				counters.TryGetValue(section.Name, out var index);
-				counters[section.Name] = index + 1;
-				var segment = FormatSectionSegment(section.Name, index);
-				var path = string.IsNullOrEmpty(parentPath) ? segment : parentPath + "/" + segment;
-				yield return new SettingsSectionInfo(path, section.Name, depth, section.Attributes.Length, section.Sections.Length);
-				foreach (var child in EnumerateSectionInfos(section.Sections, path, depth + 1))
-					yield return child;
-			}
-		}
-
-		string FormatSectionSegment(string name, int index) => $"{name}[{index}]";
-
-		(string name, int index) ParseSectionSegment(string segment) {
-			var openBracket = segment.LastIndexOf('[');
-			var closeBracket = segment.LastIndexOf(']');
-			if (openBracket < 0 || closeBracket != segment.Length - 1 || openBracket >= closeBracket)
-				return (segment, 0);
-			var name = segment.Substring(0, openBracket);
-			var indexText = segment.Substring(openBracket + 1, closeBracket - openBracket - 1);
-			if (!int.TryParse(indexText, out var index) || index < 0)
-				index = 0;
-			return (name, index);
-		}
-
-		ISettingsSection ResolveSectionPath(string path) {
-			var currentSections = settingsService.Sections;
-			ISettingsSection? current = null;
-			foreach (var segment in path.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries)) {
-				var (name, index) = ParseSectionSegment(segment);
-				var matches = currentSections.Where(a => a.Name == name).ToArray();
-				if (index >= matches.Length)
-					throw new InvalidOperationException($"Could not resolve settings section path '{path}'.");
-				current = matches[index];
-				currentSections = current.Sections;
-			}
-			return current ?? throw new InvalidOperationException($"Could not resolve settings section path '{path}'.");
-		}
-
-		SettingsSectionData ToSettingsSectionData(ISettingsSection section, string path, int depth, int maxDepth) => new SettingsSectionData(
-			path,
-			section.Name,
-			section.Attributes.Select(a => new SettingAttributeData(a.key, a.value)).ToArray(),
-			depth >= maxDepth ? Array.Empty<SettingsSectionData>() : section.Sections.Select((a, index) => new { Section = a, Index = index })
-				.GroupBy(a => a.Section.Name, StringComparer.Ordinal)
-				.SelectMany(group => group.Select((item, groupIndex) => ToSettingsSectionData(item.Section, path + "/" + FormatSectionSegment(item.Section.Name, groupIndex), depth + 1, maxDepth)))
-				.ToArray());
-
-		IEnumerable<SettingsSearchResult> EnumerateSettingsValues(ISettingsSection[] sections, string parentPath) {
-			var counters = new Dictionary<string, int>(StringComparer.Ordinal);
-			foreach (var section in sections) {
-				counters.TryGetValue(section.Name, out var index);
-				counters[section.Name] = index + 1;
-				var path = string.IsNullOrEmpty(parentPath) ? FormatSectionSegment(section.Name, index) : parentPath + "/" + FormatSectionSegment(section.Name, index);
-				foreach (var attribute in section.Attributes)
-					yield return new SettingsSearchResult(path, attribute.key, attribute.value);
-				foreach (var child in EnumerateSettingsValues(section.Sections, path))
-					yield return child;
-			}
-		}
 	}
 
+	public sealed record McpContextResult(LoadedDocumentInfo[] LoadedDocuments, DecompilerInfo DefaultDecompiler, DebugSessionStatusResult DebugStatus, DebugEventInfo[] RecentDebugEvents, long LatestDebugEventSequence, string[] SuggestedNextTools, string? ErrorMessage = null);
 	public sealed record LoadedDocumentInfo(string ShortName, string Filename, string? AssemblyFullName, string? ModuleFullName, bool IsAutoLoaded, int ChildCount, string? ErrorMessage = null);
 	public sealed record SaveAssemblyResult(bool Saved, string Message, string? OutputPath, string? ErrorMessage = null);
 	public sealed record AssemblyEditResult(bool Success, string Message, string? Name, string? Culture, string? Version, string? HashAlgorithm, string? ProcessorArch, string? ContentType, string? ErrorMessage = null);
@@ -5131,10 +5079,6 @@ namespace dnSpy.Mcp {
 	public sealed record BreakpointOperationResult(bool Success, string Message, string? ErrorMessage = null);
 	public sealed record UsageLocationInfo(string SourceDocument, string SourceMemberKind, string SourceType, string SourceName, string SourceFullName, string MetadataToken, string UsageKind, uint? IlOffset, string? OpCode, string? ErrorMessage = null);
 	public sealed record DependencyInfo(string Kind, string Name, string FullName, string? DeclaringType, string? SourceDocument, string? MetadataToken, uint? IlOffset, string? OpCode, string? ErrorMessage = null);
-	public sealed record SettingsSectionInfo(string Path, string Name, int Depth, int AttributeCount, int ChildCount, string? ErrorMessage = null);
-	public sealed record SettingAttributeData(string Name, string Value, string? ErrorMessage = null);
-	public sealed record SettingsSectionData(string Path, string Name, SettingAttributeData[] Attributes, SettingsSectionData[] Children, string? ErrorMessage = null);
-	public sealed record SettingsSearchResult(string SectionPath, string AttributeName, string AttributeValue, string? ErrorMessage = null);
 	public sealed record ExceptionCategoryInfo(string Name, string DisplayName, string ShortDisplayName, string IdentifierKind, string? ErrorMessage = null);
 	public sealed record ExceptionConditionInfo(string Type, string Value, string? ErrorMessage = null);
 	public sealed record ExceptionSettingInfo(string Category, string CategoryDisplayName, string TargetKind, string Identifier, string DisplayName, string? Description, bool IsDefault, bool BreakWhenThrown, bool BreakOnSecondChance, ExceptionConditionInfo[] Conditions, string? ErrorMessage = null);
