@@ -6,10 +6,12 @@ using System.IO;
 using System.Linq;
 using System.Globalization;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using dnSpy.Contracts.AsmEditor.Compiler;
 using dnSpy.Contracts.Debugger;
@@ -36,6 +38,7 @@ using dnSpy.Contracts.Documents.Tabs;
 using dnSpy.Contracts.Metadata;
 using dnSpy.Contracts.Scripting;
 using dnSpy.Contracts.Documents.TreeView;
+using ModelContextProtocol;
 using ModelContextProtocol.Server;
 
 namespace dnSpy.Mcp {
@@ -58,6 +61,7 @@ namespace dnSpy.Mcp {
 		readonly ILanguageCompilerProvider[] languageCompilerProviders;
 		readonly IServiceLocator serviceLocator;
 		static int nextToolCallId;
+		static readonly SemaphoreSlim documentExecutionGate = new SemaphoreSlim(1, 1);
 		static readonly object debugModulesCacheLock = new object();
 		static string? lastDebugModulesCacheKey;
 		static DateTime lastDebugModulesCacheUtc;
@@ -144,9 +148,6 @@ namespace dnSpy.Mcp {
 				return ToLoadedDocumentInfo(document);
 			});
 
-		[McpServerTool(Name = "open_assembly"), Description("Alias of load_assembly. Loads a .NET assembly or module into dnSpyEx and returns its document descriptor.")]
-		public LoadedDocumentInfo OpenAssembly([Description("Absolute or relative path to the assembly or module to load. Example: C:\\temp\\MyApp.dll")] string path) => LoadAssembly(path);
-
 		[McpServerTool(Name = "close_assembly"), Description("Closes a loaded assembly or module.")]
 		public BreakpointOperationResult CloseAssembly(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId) => LoggedCall("close_assembly", documentId, () => {
@@ -156,7 +157,7 @@ namespace dnSpy.Mcp {
 			});
 
 		[McpServerTool(Name = "clear_assemblies"), Description("Closes all loaded assemblies and modules.")]
-		public BreakpointOperationResult ClearAssemblies() => LoggedBackgroundCall("clear_assemblies", string.Empty, () => {
+		public BreakpointOperationResult ClearAssemblies() => LoggedCall("clear_assemblies", string.Empty, () => {
 			documentService.Clear();
 			return new BreakpointOperationResult(true, "Cleared all loaded documents.");
 		});
@@ -177,9 +178,11 @@ namespace dnSpy.Mcp {
 			});
 
 		[McpServerTool(Name = "save_assembly_to_file"), Description("Saves the edited in-memory assembly/module to disk.")]
-		public SaveAssemblyResult SaveAssemblyToFile(
+		public Task<SaveAssemblyResult> SaveAssemblyToFileAsync(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
-			[Description("Optional output path. When omitted, overwrites the original file.")] string? outputPath = null) => LoggedCall("save_assembly_to_file", documentId, () => {
+			[Description("Optional output path. When omitted, overwrites the original file.")] string? outputPath = null,
+			CancellationToken cancellationToken = default) => LoggedBackgroundCallAsync("save_assembly_to_file", documentId, async () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var module = document.ModuleDef ?? throw new InvalidOperationException($"Document '{document.Filename}' does not contain a module definition.");
 				var targetPath = string.IsNullOrWhiteSpace(outputPath) ? document.Filename : Path.GetFullPath(outputPath);
@@ -192,14 +195,16 @@ namespace dnSpy.Mcp {
 					var options = new ModuleWriterOptions(module) {
 						Logger = DummyLogger.NoThrowInstance,
 					};
-					module.Write(targetPath, options);
+					cancellationToken.ThrowIfCancellationRequested();
+					await Task.Run(() => module.Write(targetPath, options), cancellationToken).ConfigureAwait(false);
 					return new SaveAssemblyResult(true, "Assembly saved.", targetPath, null);
 				}
 				catch (Exception ex) {
 					var actual = UnwrapToolException(ex);
-					return new SaveAssemblyResult(false, actual.Message, targetPath, actual.Message);
+					ExceptionDispatchInfo.Capture(actual).Throw();
+					throw new InvalidOperationException("Unreachable code.");
 				}
-			});
+			}, cancellationToken);
 
 		[McpServerTool(Name = "get_module_info"), Description("Returns the current editable module metadata and PE/Cor20 settings.")]
 		public ModuleInfoResult GetModuleInfo(
@@ -208,10 +213,6 @@ namespace dnSpy.Mcp {
 				var module = document.ModuleDef ?? throw new InvalidOperationException($"Document '{document.Filename}' does not contain a module definition.");
 				return ToModuleInfoResult(document, module);
 			});
-
-		[McpServerTool(Name = "get_module_settings"), Description("Returns the current editable module settings shown by dnSpy's Edit Module dialog.")]
-		public ModuleInfoResult GetModuleSettings(
-			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId) => GetModuleInfo(documentId);
 
 		[McpServerTool(Name = "edit_module"), Description("Edits module metadata and PE/Cor20 settings shown in dnSpy's Edit Module dialog.")]
 		public ModuleEditResult EditModule(
@@ -365,7 +366,7 @@ namespace dnSpy.Mcp {
 					case "managed": {
 						if (string.IsNullOrWhiteSpace(managedEntryPointMetadataToken))
 							return CreateModuleEditFailure("managedEntryPointMetadataToken is required when entryPointKind=managed.", module);
-						var method = ResolveMethodByMetadataToken(document, managedEntryPointMetadataToken!);
+						var method = ResolveMethodByMetadataToken(document, managedEntryPointMetadataToken!, module);
 						if (method.Module != module)
 							return CreateModuleEditFailure($"Managed entry point '{method.FullName}' does not belong to module '{module.Name}'.", module);
 						module.ManagedEntryPoint = method;
@@ -387,61 +388,6 @@ namespace dnSpy.Mcp {
 
 				return CreateModuleEditSuccess("Module updated.", module);
 			});
-
-		[McpServerTool(Name = "update_module_settings"), Description("Updates the editable module settings shown by dnSpy's Edit Module dialog.")]
-		public ModuleEditResult UpdateModuleSettings(
-			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
-			[Description("Optional module name.")] string? name = null,
-			[Description("Optional module kind, eg Windows, Console, Dll, NetModule.")] string? moduleKind = null,
-			[Description("Optional CLR version preset: 1.0, 1.1, 2.0, 4.0.")] string? clrVersion = null,
-			[Description("Optional MVID GUID string. Pass empty string to clear.")] string? mvid = null,
-			[Description("Optional EncId GUID string. Pass empty string to clear.")] string? encId = null,
-			[Description("Optional EncBaseId GUID string. Pass empty string to clear.")] string? encBaseId = null,
-			[Description("Entry point kind: none, managed, native.")] string? entryPointKind = null,
-			[Description("Managed entry point metadata token when entryPointKind=managed.")] string? managedEntryPointMetadataToken = null,
-			[Description("Native entry point RVA when entryPointKind=native.")] uint? nativeEntryPointRva = null,
-			[Description("Optional metadata version string, eg v4.0.30319.")] string? runtimeVersion = null,
-			[Description("Optional tables header version, eg 0x0200 or 512.")] ushort? tablesHeaderVersion = null,
-			[Description("Optional Cor20 runtime version, eg 0x00020005.")] uint? cor20HeaderRuntimeVersion = null,
-			[Description("Optional machine, eg I386, AMD64, IA64, ARM64.")] string? machine = null,
-			[Description("Characteristics.RelocsStripped flag override.")] bool? relocsStripped = null,
-			[Description("Characteristics.ExecutableImage flag override.")] bool? executableImage = null,
-			[Description("Characteristics.LineNumsStripped flag override.")] bool? lineNumsStripped = null,
-			[Description("Characteristics.LocalSymsStripped flag override.")] bool? localSymsStripped = null,
-			[Description("Characteristics.AggressiveWsTrim flag override.")] bool? aggressiveWsTrim = null,
-			[Description("Characteristics.LargeAddressAware flag override.")] bool? largeAddressAware = null,
-			[Description("Characteristics.Reserved1 flag override.")] bool? characteristicsReserved1 = null,
-			[Description("Characteristics.BytesReversedLo flag override.")] bool? bytesReversedLo = null,
-			[Description("Characteristics.Bit32Machine flag override.")] bool? bit32Machine = null,
-			[Description("Characteristics.DebugStripped flag override.")] bool? debugStripped = null,
-			[Description("Characteristics.RemovableRunFromSwap flag override.")] bool? removableRunFromSwap = null,
-			[Description("Characteristics.NetRunFromSwap flag override.")] bool? netRunFromSwap = null,
-			[Description("Characteristics.System flag override.")] bool? system = null,
-			[Description("Characteristics.Dll flag override.")] bool? dll = null,
-			[Description("Characteristics.UpSystemOnly flag override.")] bool? upSystemOnly = null,
-			[Description("Characteristics.BytesReversedHi flag override.")] bool? bytesReversedHi = null,
-			[Description("DllCharacteristics.Reserved1 flag override.")] bool? dllReserved1 = null,
-			[Description("DllCharacteristics.Reserved2 flag override.")] bool? dllReserved2 = null,
-			[Description("DllCharacteristics.Reserved3 flag override.")] bool? dllReserved3 = null,
-			[Description("DllCharacteristics.Reserved4 flag override.")] bool? dllReserved4 = null,
-			[Description("DllCharacteristics.Reserved5 flag override.")] bool? dllReserved5 = null,
-			[Description("DllCharacteristics.HighEntropyVA flag override.")] bool? highEntropyVa = null,
-			[Description("DllCharacteristics.DynamicBase flag override.")] bool? dynamicBase = null,
-			[Description("DllCharacteristics.ForceIntegrity flag override.")] bool? forceIntegrity = null,
-			[Description("DllCharacteristics.NxCompat flag override.")] bool? nxCompat = null,
-			[Description("DllCharacteristics.NoIsolation flag override.")] bool? noIsolation = null,
-			[Description("DllCharacteristics.NoSeh flag override.")] bool? noSeh = null,
-			[Description("DllCharacteristics.NoBind flag override.")] bool? noBind = null,
-			[Description("DllCharacteristics.AppContainer flag override.")] bool? appContainer = null,
-			[Description("DllCharacteristics.WdmDriver flag override.")] bool? wdmDriver = null,
-			[Description("DllCharacteristics.GuardCf flag override.")] bool? guardCf = null,
-			[Description("DllCharacteristics.TerminalServerAware flag override.")] bool? terminalServerAware = null,
-			[Description("Cor20 ILOnly flag override.")] bool? ilOnly = null,
-			[Description("Cor20 32BitRequired flag override.")] bool? bit32Required = null,
-			[Description("Cor20 ILLibrary flag override.")] bool? ilLibrary = null,
-			[Description("Cor20 32BitPreferred flag override.")] bool? bit32Preferred = null,
-			[Description("Cor20 TrackDebugData flag override.")] bool? trackDebugData = null,
-			[Description("Cor20 StrongNameSigned flag override.")] bool? strongNameSigned = null) => EditModule(documentId, name, moduleKind, clrVersion, mvid, encId, encBaseId, entryPointKind, managedEntryPointMetadataToken, nativeEntryPointRva, runtimeVersion, tablesHeaderVersion, cor20HeaderRuntimeVersion, machine, relocsStripped, executableImage, lineNumsStripped, localSymsStripped, aggressiveWsTrim, largeAddressAware, characteristicsReserved1, bytesReversedLo, bit32Machine, debugStripped, removableRunFromSwap, netRunFromSwap, system, dll, upSystemOnly, bytesReversedHi, dllReserved1, dllReserved2, dllReserved3, dllReserved4, dllReserved5, highEntropyVa, dynamicBase, forceIntegrity, nxCompat, noIsolation, noSeh, noBind, appContainer, wdmDriver, guardCf, terminalServerAware, ilOnly, bit32Required, ilLibrary, bit32Preferred, trackDebugData, strongNameSigned);
 
 		[McpServerTool(Name = "list_module_custom_attributes"), Description("Lists module-level custom attributes.")]
 		public ModuleCustomAttributeInfo[] ListModuleCustomAttributes(
@@ -469,9 +415,7 @@ namespace dnSpy.Mcp {
 				var document = ResolveDocument(documentId);
 				var module = document.ModuleDef ?? throw new InvalidOperationException("Target document does not contain a module definition.");
 				try {
-					var ctor = ResolveMethodLikeByMetadataToken(document, constructorMetadataToken);
-					if (!string.Equals(ctor.Name, ".ctor", StringComparison.Ordinal))
-						return new ModuleCustomAttributeEditResult(false, $"Method '{ctor.FullName}' is not an instance constructor.", Array.Empty<CompilerLikeDiagnostic>(), null);
+					var ctor = ResolveAttributeConstructorByMetadataToken(module, constructorMetadataToken);
 					var arguments = fixedArguments ?? Array.Empty<string>();
 					var expectedArgCount = ctor.MethodSig?.GetParamCount() ?? 0;
 					if (arguments.Length != expectedArgCount)
@@ -487,32 +431,71 @@ namespace dnSpy.Mcp {
 				}
 				catch (Exception ex) {
 					var actual = UnwrapToolException(ex);
-					return new ModuleCustomAttributeEditResult(false, actual.Message, new[] { new CompilerLikeDiagnostic("Error", "MODCA001", actual.Message) }, null);
+					ExceptionDispatchInfo.Capture(actual).Throw();
+					throw new InvalidOperationException("Unreachable code.");
 				}
 			});
 
 		[McpServerTool(Name = "add_type_from_csharp"), Description("Adds one or more top-level types to a module by compiling C# source, similar to dnSpy's Add Class command.")]
-		public AddTypeFromCSharpResult AddTypeFromCSharp(
+		public Task<AddTypeFromCSharpResult> AddTypeFromCSharpAsync(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
-			[Description("C# source code containing one or more top-level type declarations.")] string sourceCode) => LoggedCall("add_type_from_csharp", documentId, () => {
+			[Description("C# source code containing one or more top-level type declarations.")] string sourceCode,
+			CancellationToken cancellationToken = default) => LoggedBackgroundCallAsync("add_type_from_csharp", documentId, async () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var module = document.ModuleDef ?? throw new InvalidOperationException("Target document does not contain a module definition.");
 				if (string.IsNullOrWhiteSpace(sourceCode))
 					return new AddTypeFromCSharpResult(false, "Source code is empty.", Array.Empty<CompilerLikeDiagnostic>(), Array.Empty<TypeInfo>(), null);
 
-				using var compileSession = CreateAddTypeCompilerSession(module);
-				var compilation = CompileAddTypeSource(module, sourceCode, compileSession);
-				if (compilation.Result is null || !compilation.Result.Value.Success)
-					return new AddTypeFromCSharpResult(false, "Compilation failed.", compilation.Diagnostics, Array.Empty<TypeInfo>(), null);
+				ILanguageCompiler? compiler = null;
+				AddTypeCompilerSession? compileSession = null;
+				try {
+					compiler = mcpServerController.RunOnUISync(() => ResolveAddTypeCompilerProvider().Create(CompilationKind.AddClass));
+					cancellationToken.ThrowIfCancellationRequested();
+					var references = new CompilerReferenceSession(module, compiler.GetRequiredAssemblyReferences(module), cancellationToken);
+					compileSession = new AddTypeCompilerSession(compiler, references);
+					compiler = null;
 
-				var compiledResult = compilation.Result.Value;
-				var import = ImportCompiledTypes(module, compiledResult.RawFile!, compiledResult.DebugFile);
-				if (!import.Success)
-					return new AddTypeFromCSharpResult(false, import.Message, import.Diagnostics, Array.Empty<TypeInfo>(), null);
+					mcpServerController.RunOnUISync(() => {
+						cancellationToken.ThrowIfCancellationRequested();
+						InitializeAddTypeCompilerSession(module, compileSession);
+						compileSession.Compiler.AddDocuments(new[] { new CompilerDocumentInfo(sourceCode, "main.cs") });
+					});
 
-				var addedTypes = import.AddedTypes.Select(ToTypeInfo).ToArray();
-				return new AddTypeFromCSharpResult(true, $"Added {addedTypes.Length} type(s).", import.Diagnostics, addedTypes, null);
-			});
+					var compilation = await CompileAddTypeSourceAsync(compileSession, cancellationToken).ConfigureAwait(false);
+					if (compilation.Result is null || !compilation.Result.Value.Success)
+						return new AddTypeFromCSharpResult(false, "Compilation failed.", compilation.Diagnostics, Array.Empty<TypeInfo>(), null);
+
+					cancellationToken.ThrowIfCancellationRequested();
+					var compiledResult = compilation.Result.Value;
+					return mcpServerController.RunOnUISync(() => {
+						cancellationToken.ThrowIfCancellationRequested();
+						if (!documentService.GetDocuments().Contains(document))
+							throw new InvalidOperationException($"Target document '{document.Filename}' was closed while compilation was running.");
+						var import = ImportCompiledTypes(module, compiledResult.RawFile!, compiledResult.DebugFile);
+						if (!import.Success)
+							return new AddTypeFromCSharpResult(false, import.Message, import.Diagnostics, Array.Empty<TypeInfo>(), null);
+
+						var addedTypes = import.AddedTypes.Select(ToTypeInfo).ToArray();
+						return new AddTypeFromCSharpResult(true, $"Added {addedTypes.Length} type(s).", import.Diagnostics, addedTypes, null);
+					});
+				}
+				finally {
+					var sessionToDispose = compileSession;
+					var compilerToDispose = compiler;
+					if (sessionToDispose is not null || compilerToDispose is not null) {
+						try {
+							mcpServerController.RunOnUISync(() => {
+								sessionToDispose?.Dispose();
+								compilerToDispose?.Dispose();
+							});
+						}
+						catch (Exception ex) {
+							logger.WriteError($"Failed to dispose Add Class compiler resources: {UnwrapToolException(ex).Message}");
+						}
+					}
+				}
+			}, cancellationToken);
 
 		[McpServerTool(Name = "delete_type"), Description("Deletes a type from the specified document by name or metadata token.")]
 		public DeleteTypeResult DeleteType(
@@ -605,8 +588,8 @@ namespace dnSpy.Mcp {
 				}
 				catch (Exception ex) {
 					var actual = UnwrapToolException(ex);
-					diagnostics.Add(new CompilerLikeDiagnostic("Error", "ILPATCH001", actual.Message));
-					return new MethodIlPatchResult(false, actual.Message, diagnostics.ToArray(), null);
+					ExceptionDispatchInfo.Capture(actual).Throw();
+					throw new InvalidOperationException("Unreachable code.");
 				}
 			});
 
@@ -693,22 +676,6 @@ namespace dnSpy.Mcp {
 					asm.DeclSecurities.Count);
 			});
 
-		[McpServerTool(Name = "update_assembly_settings"), Description("Updates the editable assembly settings shown by dnSpy's Edit Assembly dialog main page.")]
-		public AssemblyEditResult UpdateAssemblySettings(
-			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
-			[Description("Optional new assembly simple name.")] string? name = null,
-			[Description("Optional new culture string. Use empty for neutral culture.")] string? culture = null,
-			[Description("Optional version string, eg 1.2.3.4.")] string? version = null,
-			[Description("Optional hash algorithm name, eg SHA1, SHA256, None.")] string? hashAlgorithm = null,
-			[Description("Optional public key as hex string (no 0x prefix).") ] string? publicKeyHex = null,
-			[Description("Optional processor architecture: None, MSIL, x86, IA64, AMD64, ARM, ARM64, NoPlatform.")] string? processorArch = null,
-			[Description("Optional content type: Default or WindowsRuntime.")] string? contentType = null,
-			[Description("Optional PublicKey flag override.")] bool? flagPublicKey = null,
-			[Description("Optional ProcessorArchSpecified flag override.")] bool? flagProcessorArchSpecified = null,
-			[Description("Optional Retargetable flag override.")] bool? flagRetargetable = null,
-			[Description("Optional EnableJITCompileTracking flag override.")] bool? flagEnableJitCompileTracking = null,
-			[Description("Optional DisableJITCompileOptimizer flag override.")] bool? flagDisableJitCompileOptimizer = null) => EditAssemblyBasicInfo(documentId, name, culture, version, hashAlgorithm, publicKeyHex, processorArch, contentType, flagPublicKey, flagProcessorArchSpecified, flagRetargetable, flagEnableJitCompileTracking, flagDisableJitCompileOptimizer);
-
 		[McpServerTool(Name = "list_assembly_custom_attributes"), Description("Lists assembly-level custom attributes.")]
 		public AssemblyCustomAttributeInfo[] ListAssemblyCustomAttributes(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId) => LoggedCall("list_assembly_custom_attributes", documentId, () => {
@@ -736,10 +703,9 @@ namespace dnSpy.Mcp {
 			[Description("Constructor fixed arguments as strings, in parameter order.")] string[]? fixedArguments = null) => LoggedCall("add_assembly_custom_attribute", documentId, () => {
 				var document = ResolveDocument(documentId);
 				var asm = document.AssemblyDef ?? throw new InvalidOperationException("Target document is not an assembly.");
+				var module = asm.ManifestModule ?? throw new InvalidOperationException("Target assembly does not have manifest module metadata.");
 				try {
-					var ctor = ResolveMethodLikeByMetadataToken(document, constructorMetadataToken);
-					if (!string.Equals(ctor.Name, ".ctor", StringComparison.Ordinal))
-						return new AssemblyCustomAttributeEditResult(false, $"Method '{ctor.FullName}' is not an instance constructor.", Array.Empty<CompilerLikeDiagnostic>(), null);
+					var ctor = ResolveAttributeConstructorByMetadataToken(module, constructorMetadataToken);
 
 					var arguments = fixedArguments ?? Array.Empty<string>();
 					var expectedArgCount = ctor.MethodSig?.GetParamCount() ?? 0;
@@ -760,7 +726,8 @@ namespace dnSpy.Mcp {
 				}
 				catch (Exception ex) {
 					var actual = UnwrapToolException(ex);
-					return new AssemblyCustomAttributeEditResult(false, actual.Message, new[] { new CompilerLikeDiagnostic("Error", "ASMED001", actual.Message) }, null);
+					ExceptionDispatchInfo.Capture(actual).Throw();
+					throw new InvalidOperationException("Unreachable code.");
 				}
 			});
 
@@ -824,29 +791,32 @@ namespace dnSpy.Mcp {
 			});
 
 		[McpServerTool(Name = "list_attachable_processes"), Description("Lists processes that dnSpyEx can attach to.")]
-		public AttachableProcessInfo[] ListAttachableProcesses(
+		public Task<AttachableProcessInfo[]> ListAttachableProcessesAsync(
 			[Description("Optional process names. Supports wildcards like * and ?.")] string[]? processNames = null,
 			[Description("Optional process ids to match.")] int[]? processIds = null,
-			[Description("Optional attach provider names. See predefined attach providers.")] string[]? providerNames = null) => LoggedCall("list_attachable_processes", string.Empty, () => {
-				var attachableProcesses = GetAttachableProcessesSafe(processNames, processIds, providerNames);
-				return attachableProcesses
-					.Where(IsUsableAttachableProcess)
-					.GroupBy(a => $"{a.ProcessId}|{a.RuntimeKindGuid}|{a.RuntimeName}", StringComparer.OrdinalIgnoreCase)
-					.Select(g => g.First())
+			[Description("Optional attach provider names. See predefined attach providers.")] string[]? providerNames = null,
+			CancellationToken cancellationToken = default) => LoggedBackgroundCallAsync("list_attachable_processes", string.Empty, async () => {
+				var attachableProcesses = await GetAttachableProcessesSafeAsync(processNames, processIds, providerNames, cancellationToken).ConfigureAwait(false);
+				cancellationToken.ThrowIfCancellationRequested();
+				return DistinctAttachableProcesses(attachableProcesses)
 					.OrderBy(a => a.ProcessId)
 					.ThenBy(a => a.RuntimeName, StringComparer.OrdinalIgnoreCase)
 					.Select(ToAttachableProcessInfo)
 					.ToArray();
-			});
+			}, cancellationToken);
 
 		[McpServerTool(Name = "attach_to_process"), Description("Attaches dnSpyEx to a running process.")]
-		public AttachProcessResult AttachToProcess(
+		public Task<AttachProcessResult> AttachToProcessAsync(
 			[Description("Process id to attach to.")] int processId,
 			[Description("Optional process name filter. Supports wildcards like * and ?.")] string? processName = null,
 			[Description("Optional runtime name to disambiguate multiple candidates.")] string? runtimeName = null,
-			[Description("Optional attach provider names. See predefined attach providers.")] string[]? providerNames = null) => LoggedCall("attach_to_process", processId.ToString(), () => {
+			[Description("Optional runtime kind GUID returned by list_attachable_processes.")] Guid? runtimeKindGuid = null,
+			[Description("Optional attach provider names. See predefined attach providers.")] string[]? providerNames = null,
+			CancellationToken cancellationToken = default) => LoggedBackgroundCallAsync("attach_to_process", processId.ToString(), async () => {
 				var processNames = string.IsNullOrWhiteSpace(processName) ? null : new[] { processName.Trim() };
-				var attachableProcesses = GetAttachableProcessesSafe(processNames, new[] { processId }, providerNames);
+				var providerResults = await GetAttachableProcessesSafeAsync(processNames, new[] { processId }, providerNames, cancellationToken).ConfigureAwait(false);
+				cancellationToken.ThrowIfCancellationRequested();
+				var attachableProcesses = DistinctAttachableProcesses(providerResults);
 				if (attachableProcesses.Length == 0)
 					return new AttachProcessResult(false, $"No attachable process candidates were found for PID {processId}.", null);
 
@@ -857,48 +827,66 @@ namespace dnSpy.Mcp {
 					if (candidates.Length == 0)
 						return new AttachProcessResult(false, $"No attachable process candidates matched PID {processId} and runtime '{normalizedRuntimeName}'.", attachableProcesses.Select(ToAttachableProcessInfo).ToArray());
 				}
+				if (runtimeKindGuid is not null) {
+					candidates = candidates.Where(a => a.RuntimeKindGuid == runtimeKindGuid.Value).ToArray();
+					if (candidates.Length == 0)
+						return new AttachProcessResult(false, $"No attachable process candidates matched PID {processId} and runtime kind '{runtimeKindGuid.Value}'.", attachableProcesses.Select(ToAttachableProcessInfo).ToArray());
+				}
 
 				if (candidates.Length > 1)
-					return new AttachProcessResult(false, $"Multiple attach candidates matched PID {processId}. Specify runtimeName to disambiguate.", candidates.Select(ToAttachableProcessInfo).ToArray());
+					return new AttachProcessResult(false, $"Multiple attach candidates matched PID {processId}. Specify runtimeName, runtimeKindGuid, or providerNames to disambiguate.", candidates.Select(ToAttachableProcessInfo).ToArray());
 
 				var attachableProcess = candidates[0];
-				var error = dbgManager.Start(attachableProcess.GetOptions());
-				if (!string.IsNullOrWhiteSpace(error))
-					return new AttachProcessResult(false, error, new[] { ToAttachableProcessInfo(attachableProcess) });
+				cancellationToken.ThrowIfCancellationRequested();
+				return mcpServerController.RunOnUISync(() => {
+					cancellationToken.ThrowIfCancellationRequested();
+					var error = dbgManager.Start(attachableProcess.GetOptions());
+					if (!string.IsNullOrWhiteSpace(error))
+						return new AttachProcessResult(false, error, new[] { ToAttachableProcessInfo(attachableProcess) });
 
-				return new AttachProcessResult(true, $"Attached to PID {attachableProcess.ProcessId} ({attachableProcess.RuntimeName}).", new[] { ToAttachableProcessInfo(attachableProcess) });
-			});
+					return new AttachProcessResult(true, $"Attached to PID {attachableProcess.ProcessId} ({attachableProcess.RuntimeName}).", new[] { ToAttachableProcessInfo(attachableProcess) });
+				});
+			}, cancellationToken);
 
 		[McpServerTool(Name = "evaluate_expression"), Description("Evaluates an expression in the current debugger context.")]
 		public EvaluateExpressionResult EvaluateExpression(
 			[Description("Expression to evaluate.")] string expression,
-			[Description("Optional explicit language name; if omitted, uses the current runtime language.")] string? languageName = null) => LoggedCall("evaluate_expression", expression, () => {
+			[Description("Optional explicit language name; if omitted, uses the current runtime language.")] string? languageName = null,
+			CancellationToken cancellationToken = default) => LoggedCall("evaluate_expression", expression, () => {
 				if (string.IsNullOrWhiteSpace(expression))
 					throw new ArgumentException("Expression must not be empty.", nameof(expression));
 
-				var evalInfo = TryCreateEvaluationInfo(languageName, out var errorMessage, out var language, out var frame);
+				var evalInfo = TryCreateEvaluationInfo(languageName, cancellationToken, out var errorMessage, out var language, out var frame);
 				if (errorMessage is not null)
 					return new EvaluateExpressionResult(false, expression, language?.Name, frame?.Thread?.Process?.Id, frame?.Thread?.Id, null, null, null, errorMessage);
 
-				var evalResult = language!.ExpressionEvaluator.Evaluate(evalInfo!, expression, DbgEvaluationOptions.Expression | DbgEvaluationOptions.NoSideEffects, null);
-				var typeText = string.Empty;
-				string? rawValueText = null;
-				if (evalResult.Value is DbgValue value) {
-					var output = new DbgStringBuilderTextWriter();
-					language.Formatter.FormatType(evalInfo!, output, value, DbgValueFormatterTypeOptions.Namespaces | DbgValueFormatterTypeOptions.IntrinsicTypeKeywords, null);
-					typeText = output.Text;
-					var valueOutput = new DbgStringBuilderTextWriter();
-					language.Formatter.FormatValue(evalInfo!, valueOutput, value, DbgValueFormatterOptions.Namespaces | DbgValueFormatterOptions.IntrinsicTypeKeywords | DbgValueFormatterOptions.FullString | DbgValueFormatterOptions.NoDebuggerDisplay, null);
-					rawValueText = valueOutput.Text;
+				DbgValue? value = null;
+				try {
+					var evalResult = language!.ExpressionEvaluator.Evaluate(evalInfo!, expression, DbgEvaluationOptions.Expression | DbgEvaluationOptions.NoSideEffects, null);
+					value = evalResult.Value;
+					var typeText = string.Empty;
+					string? rawValueText = null;
+					if (value is not null) {
+						var output = new DbgStringBuilderTextWriter();
+						language.Formatter.FormatType(evalInfo!, output, value, DbgValueFormatterTypeOptions.Namespaces | DbgValueFormatterTypeOptions.IntrinsicTypeKeywords, null);
+						typeText = output.Text;
+						var valueOutput = new DbgStringBuilderTextWriter();
+						language.Formatter.FormatValue(evalInfo!, valueOutput, value, DbgValueFormatterOptions.Namespaces | DbgValueFormatterOptions.IntrinsicTypeKeywords | DbgValueFormatterOptions.FullString | DbgValueFormatterOptions.NoDebuggerDisplay, null);
+						rawValueText = valueOutput.Text;
+					}
+
+					return new EvaluateExpressionResult(value is not null, expression, language.Name, frame!.Thread.Process.Id, frame.Thread.Id, typeText, rawValueText, evalResult.Error, null);
 				}
-
-				return new EvaluateExpressionResult(evalResult.Value is not null, expression, language.Name, frame!.Thread.Process.Id, frame.Thread.Id, typeText, rawValueText, evalResult.Error, null);
+				finally {
+					try {
+						value?.Close();
+					}
+					finally {
+						// The call stack service owns the shared active frame; only the context is ours.
+						evalInfo!.Context.Close();
+					}
+				}
 			});
-
-		[McpServerTool(Name = "evaluate_debug_expression"), Description("Evaluates an expression in the current debugger context.")]
-		public EvaluateExpressionResult EvaluateDebugExpression(
-			[Description("Expression to evaluate.")] string expression,
-			[Description("Optional explicit language name; if omitted, uses the current runtime language.")] string? languageName = null) => EvaluateExpression(expression, languageName);
 
 		[McpServerTool(Name = "list_types"), Description("Lists types from a loaded document. Use documentId from list_loaded_assemblies or load_assembly.")]
 		public TypeInfo[] ListTypes(
@@ -949,7 +937,7 @@ namespace dnSpy.Mcp {
 
 		[McpServerTool(Name = "resolve_method_for_breakpoint"), Description("Resolves the best method candidate for a breakpoint request and returns fallback details instead of failing blindly.")]
 		public MethodResolutionPreviewResult ResolveMethodForBreakpointTool(
-			[Description("Document identifier. File paths are auto-loaded if needed.")] string documentId,
+			[Description("Loaded document identifier. Prefer the exact Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Type full name or short name that owns the method.")] string typeName,
 			[Description("Method name.")] string methodName,
 			[Description("Optional metadata token such as 0x06001234. When provided, it takes precedence over name-based matching.")] string? metadataToken = null,
@@ -969,7 +957,9 @@ namespace dnSpy.Mcp {
 			[Description("Optional symbol kinds to include. Supported values: type, method, field, property, event.")] string[]? symbolKinds = null,
 			[Description("Whether the search should be case-sensitive.")] bool caseSensitive = false,
 			[Description("Whether query should be treated as a regular expression.")] bool useRegex = false,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedCall("search_symbols", query, () => {
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => LoggedCall("search_symbols", query, () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				if (string.IsNullOrWhiteSpace(query))
 					throw new ArgumentException("Search query must not be empty.", nameof(query));
 
@@ -979,6 +969,7 @@ namespace dnSpy.Mcp {
 				foreach (var document in EnumerateDocuments(documentId)) {
 					foreach (var module in document.GetModules<ModuleDef>()) {
 						foreach (var type in module.GetTypes()) {
+							cancellationToken.ThrowIfCancellationRequested();
 							if (kinds.Contains("type") && IsSymbolMatch(type.FullName, type.Name, query, caseSensitive, regex))
 								AddSearchResult(results, maxResults, ToSearchSymbolResult(document, type));
 
@@ -1077,10 +1068,6 @@ namespace dnSpy.Mcp {
 					assemblyAttributes);
 			});
 
-		[McpServerTool(Name = "get_assembly_summary"), Description("Returns display-oriented assembly information, including entry point, target framework, attributes, and references.")]
-		public AssemblyInfoResult GetAssemblySummary(
-			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId) => GetAssemblyInfo(documentId);
-
 		[McpServerTool(Name = "list_assembly_references"), Description("Lists the assembly references used by a loaded assembly or module.")]
 		public AssemblyReferenceInfo[] ListAssemblyReferences(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId) => LoggedCall("list_assembly_references", documentId, () => {
@@ -1106,11 +1093,13 @@ namespace dnSpy.Mcp {
 			});
 
 		[McpServerTool(Name = "export_resource"), Description("Exports an embedded manifest resource to a file path.")]
-		public ResourceExportResult ExportResource(
+		public Task<ResourceExportResult> ExportResourceAsync(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Resource name.")] string resourceName,
 			[Description("Output file path.")] string outputPath,
-			[Description("Optional module identifier to disambiguate a resource name across modules.")] string? moduleId = null) => LoggedCall("export_resource", $"{documentId}::{resourceName}", () => {
+			[Description("Optional module identifier to disambiguate a resource name across modules.")] string? moduleId = null,
+			CancellationToken cancellationToken = default) => LoggedBackgroundCallAsync("export_resource", $"{documentId}::{resourceName}", async () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var (module, resource) = ResolveResource(document, resourceName, moduleId);
 				if (resource is not EmbeddedResource embeddedResource)
@@ -1122,9 +1111,9 @@ namespace dnSpy.Mcp {
 					Directory.CreateDirectory(directory);
 
 				var data = embeddedResource.CreateReader().ToArray();
-				File.WriteAllBytes(fullPath, data);
+				await File.WriteAllBytesAsync(fullPath, data, cancellationToken).ConfigureAwait(false);
 				return new ResourceExportResult(document.Filename, module.FullName, resource.Name, resource.ResourceType.ToString(), fullPath, true, data.Length, null);
-			});
+			}, cancellationToken);
 
 		[McpServerTool(Name = "get_pe_info"), Description("Returns PE header and section information for a loaded document.")]
 		public PeInfoResult GetPeInfo(
@@ -1165,13 +1154,15 @@ namespace dnSpy.Mcp {
 		public DecompiledTextResult DecompileAssembly(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Optional decompiler name, for example C#.")] string? decompilerName = null,
-			[Description("Optional maximum number of characters to return. When omitted, the full text is returned.")] int? maxLength = null) => LoggedCall("decompile_assembly", documentId, () => {
+			[Description("Optional maximum number of characters to return. When omitted, the full text is returned.")] int? maxLength = null,
+			CancellationToken cancellationToken = default) => LoggedCall("decompile_assembly", documentId, () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var decompiler = ResolveDecompiler(decompilerName);
 				if (document.AssemblyDef is not null)
-					return ApplyTextLimit(DecompileWithFallback(decompilerName, decompiler, document.Filename, (selectedDecompiler, output) => selectedDecompiler.Decompile(document.AssemblyDef, output, CreateDecompilationContext())), maxLength);
+					return ApplyTextLimit(DecompileWithFallback(decompilerName, decompiler, document.Filename, (selectedDecompiler, output) => selectedDecompiler.Decompile(document.AssemblyDef, output, CreateDecompilationContext(cancellationToken))), maxLength);
 				if (document.ModuleDef is not null)
-					return ApplyTextLimit(DecompileWithFallback(decompilerName, decompiler, document.Filename, (selectedDecompiler, output) => selectedDecompiler.Decompile(document.ModuleDef, output, CreateDecompilationContext())), maxLength);
+					return ApplyTextLimit(DecompileWithFallback(decompilerName, decompiler, document.Filename, (selectedDecompiler, output) => selectedDecompiler.Decompile(document.ModuleDef, output, CreateDecompilationContext(cancellationToken))), maxLength);
 				throw new InvalidOperationException($"Document '{documentId}' is not a .NET assembly or module.");
 			});
 
@@ -1179,11 +1170,13 @@ namespace dnSpy.Mcp {
 		public DecompiledTextResult DecompileType(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Type full name or short name.")] string typeName,
-			[Description("Optional decompiler name, for example C#.")] string? decompilerName = null) => LoggedCall("decompile_type", $"{documentId}::{typeName}", () => {
+			[Description("Optional decompiler name, for example C#.")] string? decompilerName = null,
+			CancellationToken cancellationToken = default) => LoggedCall("decompile_type", $"{documentId}::{typeName}", () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var type = ResolveType(document, typeName);
 				var decompiler = ResolveDecompiler(decompilerName);
-				return DecompileWithFallback(decompilerName, decompiler, type.FullName, (selectedDecompiler, output) => selectedDecompiler.Decompile(type, output, CreateDecompilationContext()));
+				return DecompileWithFallback(decompilerName, decompiler, type.FullName, (selectedDecompiler, output) => selectedDecompiler.Decompile(type, output, CreateDecompilationContext(cancellationToken)));
 			});
 
 		[McpServerTool(Name = "decompile_method"), Description("Decompiles a method from a loaded assembly.")]
@@ -1195,49 +1188,31 @@ namespace dnSpy.Mcp {
 			[Description("Optional full method signature, for example 'System.Void System.Console::WriteLine(System.String)'.") ] string? methodSignature = null,
 			[Description("Optional parameter type list used to disambiguate overloads, for example ['System.String'].")] string[]? parameterTypes = null,
 			[Description("Optional parameter count used to disambiguate overloads.")] int? parameterCount = null,
-			[Description("Optional decompiler name, for example C#.")] string? decompilerName = null) => LoggedCall("decompile_method", $"{documentId}::{typeName}::{methodName}", () => {
+			[Description("Optional decompiler name, for example C#.")] string? decompilerName = null,
+			CancellationToken cancellationToken = default) => LoggedCall("decompile_method", $"{documentId}::{typeName}::{methodName}", () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var type = ResolveType(document, typeName);
 				var method = ResolveMethod(document, type, methodName, metadataToken, methodSignature, parameterTypes, parameterCount);
 				var decompiler = ResolveDecompiler(decompilerName);
-				return DecompileWithFallback(decompilerName, decompiler, method.FullName, (selectedDecompiler, output) => selectedDecompiler.Decompile(method, output, CreateDecompilationContext()));
+				return DecompileWithFallback(decompilerName, decompiler, method.FullName, (selectedDecompiler, output) => selectedDecompiler.Decompile(method, output, CreateDecompilationContext(cancellationToken)));
 			});
-
-		[McpServerTool(Name = "find_method_usages"), Description("Alias of find_callers. Finds methods that reference a target method.")]
-		public UsageLocationInfo[] FindMethodUsages(
-			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
-			[Description("Type full name or short name that owns the method.")] string typeName,
-			[Description("Method name.")] string methodName,
-			[Description("Optional metadata token such as 0x06001234. When provided, it takes precedence over name-based matching.")] string? metadataToken = null,
-			[Description("Optional full method signature.")] string? methodSignature = null,
-			[Description("Optional parameter type list used to disambiguate overloads.")] string[]? parameterTypes = null,
-			[Description("Optional parameter count used to disambiguate overloads.")] int? parameterCount = null,
-			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => FindMethodUsagesCore("find_callers", documentId, typeName, methodName, metadataToken, methodSignature, parameterTypes, parameterCount, searchDocumentId, maxResults);
-
-		[McpServerTool(Name = "get_method_uses"), Description("Alias of find_callees. Lists methods, fields, and types referenced by a target method.")]
-		public DependencyInfo[] GetMethodUses(
-			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
-			[Description("Type full name or short name that owns the method.")] string typeName,
-			[Description("Method name.")] string methodName,
-			[Description("Optional metadata token such as 0x06001234. When provided, it takes precedence over name-based matching.")] string? metadataToken = null,
-			[Description("Optional full method signature.")] string? methodSignature = null,
-			[Description("Optional parameter type list used to disambiguate overloads.")] string[]? parameterTypes = null,
-			[Description("Optional parameter count used to disambiguate overloads.")] int? parameterCount = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => GetMethodUsesCore("find_callees", documentId, typeName, methodName, metadataToken, methodSignature, parameterTypes, parameterCount, maxResults);
 
 		[McpServerTool(Name = "find_type_usages"), Description("Finds types, fields, and methods that reference a target type.")]
 		public UsageLocationInfo[] FindTypeUsages(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Type full name or short name.")] string typeName,
 			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedCall("find_type_usages", $"{documentId}::{typeName}", () => {
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => LoggedCall("find_type_usages", $"{documentId}::{typeName}", () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var targetType = ResolveType(document, typeName);
 				var results = new List<UsageLocationInfo>();
 
 				foreach (var searchDocument in EnumerateDocuments(searchDocumentId)) {
 					foreach (var candidateType in searchDocument.GetModules<ModuleDef>().SelectMany(a => a.GetTypes())) {
+						cancellationToken.ThrowIfCancellationRequested();
 						if (TypeReferencesTarget(candidateType.BaseType, targetType) || candidateType.Interfaces.Any(a => TypeReferencesTarget(a.Interface, targetType))) {
 							results.Add(CreateTypeUsageLocationInfo(searchDocument, candidateType, "type-definition"));
 							if (results.Count >= Math.Max(1, maxResults))
@@ -1275,7 +1250,8 @@ namespace dnSpy.Mcp {
 			[Description("Optional parameter type list used to disambiguate overloads.")] string[]? parameterTypes = null,
 			[Description("Optional parameter count used to disambiguate overloads.")] int? parameterCount = null,
 			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => FindMethodUsages(documentId, typeName, methodName, metadataToken, methodSignature, parameterTypes, parameterCount, searchDocumentId, maxResults);
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => FindMethodUsagesCore("find_callers", documentId, typeName, methodName, metadataToken, methodSignature, parameterTypes, parameterCount, searchDocumentId, maxResults, cancellationToken);
 
 		[McpServerTool(Name = "find_callees"), Description("Finds methods, fields, and types used by a target method.")]
 		public DependencyInfo[] FindCallees(
@@ -1286,7 +1262,8 @@ namespace dnSpy.Mcp {
 			[Description("Optional full method signature.")] string? methodSignature = null,
 			[Description("Optional parameter type list used to disambiguate overloads.")] string[]? parameterTypes = null,
 			[Description("Optional parameter count used to disambiguate overloads.")] int? parameterCount = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => GetMethodUses(documentId, typeName, methodName, metadataToken, methodSignature, parameterTypes, parameterCount, maxResults);
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => GetMethodUsesCore("find_callees", documentId, typeName, methodName, metadataToken, methodSignature, parameterTypes, parameterCount, maxResults, cancellationToken);
 
 		[McpServerTool(Name = "find_field_reads"), Description("Finds methods that read a target field.")]
 		public UsageLocationInfo[] FindFieldReads(
@@ -1294,7 +1271,8 @@ namespace dnSpy.Mcp {
 			[Description("Type full name or short name that owns the field.")] string typeName,
 			[Description("Field name.")] string fieldName,
 			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => FindFieldAccesses(documentId, typeName, fieldName, showWrites: false, searchDocumentId, maxResults);
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => FindFieldAccesses(documentId, typeName, fieldName, showWrites: false, searchDocumentId, maxResults, cancellationToken);
 
 		[McpServerTool(Name = "find_field_writes"), Description("Finds methods that write a target field.")]
 		public UsageLocationInfo[] FindFieldWrites(
@@ -1302,7 +1280,8 @@ namespace dnSpy.Mcp {
 			[Description("Type full name or short name that owns the field.")] string typeName,
 			[Description("Field name.")] string fieldName,
 			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => FindFieldAccesses(documentId, typeName, fieldName, showWrites: true, searchDocumentId, maxResults);
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => FindFieldAccesses(documentId, typeName, fieldName, showWrites: true, searchDocumentId, maxResults, cancellationToken);
 
 		[McpServerTool(Name = "find_property_reads"), Description("Finds methods that read a target property.")]
 		public UsageLocationInfo[] FindPropertyReads(
@@ -1310,7 +1289,8 @@ namespace dnSpy.Mcp {
 			[Description("Type full name or short name that owns the property.")] string typeName,
 			[Description("Property name.")] string propertyName,
 			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => FindPropertyAccesses(documentId, typeName, propertyName, isSetter: false, searchDocumentId, maxResults);
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => FindPropertyAccesses(documentId, typeName, propertyName, isSetter: false, searchDocumentId, maxResults, cancellationToken);
 
 		[McpServerTool(Name = "find_property_writes"), Description("Finds methods that write a target property.")]
 		public UsageLocationInfo[] FindPropertyWrites(
@@ -1318,19 +1298,23 @@ namespace dnSpy.Mcp {
 			[Description("Type full name or short name that owns the property.")] string typeName,
 			[Description("Property name.")] string propertyName,
 			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => FindPropertyAccesses(documentId, typeName, propertyName, isSetter: true, searchDocumentId, maxResults);
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => FindPropertyAccesses(documentId, typeName, propertyName, isSetter: true, searchDocumentId, maxResults, cancellationToken);
 
-		[McpServerTool(Name = "find_base_types"), Description("Finds the base type chain for a type. If documentId is wrong, the tool falls back to other loaded documents.")]
+		[McpServerTool(Name = "find_base_types"), Description("Finds the base type chain for a type resolved only within the specified document.")]
 		public TypeRelationInfo[] FindBaseTypes(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Type full name or short name.")] string typeName,
-			[Description("Maximum number of results to return.")] int maxResults = 20) => LoggedCall("find_base_types", $"{documentId}::{typeName}", () => {
+			[Description("Maximum number of results to return.")] int maxResults = 20,
+			CancellationToken cancellationToken = default) => LoggedCall("find_base_types", $"{documentId}::{typeName}", () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var type = ResolveType(document, typeName);
 				var results = new List<TypeRelationInfo>();
 				var current = type.BaseType;
 				var distance = 1;
 				while (current is not null && results.Count < Math.Max(1, maxResults)) {
+					cancellationToken.ThrowIfCancellationRequested();
 					var resolved = current.ResolveTypeDef();
 					results.Add(new TypeRelationInfo(document.Filename, type.FullName, resolved?.FullName ?? current.FullName, "base-type", distance, resolved is null ? null : $"0x{resolved.MDToken.Raw:X8}"));
 					current = resolved?.BaseType;
@@ -1339,17 +1323,20 @@ namespace dnSpy.Mcp {
 				return results.ToArray();
 			});
 
-		[McpServerTool(Name = "find_derived_types"), Description("Finds types derived from a target type. Prefer the assembly that defines the base type, but the tool can fall back across loaded documents.")]
+		[McpServerTool(Name = "find_derived_types"), Description("Finds loaded types derived from a target type that is resolved only within the specified document.")]
 		public TypeRelationInfo[] FindDerivedTypes(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Type full name or short name.")] string typeName,
 			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedCall("find_derived_types", $"{documentId}::{typeName}", () => {
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => LoggedCall("find_derived_types", $"{documentId}::{typeName}", () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var targetType = ResolveType(document, typeName);
 				var results = new List<TypeRelationInfo>();
 				foreach (var searchDocument in EnumerateDocuments(searchDocumentId)) {
 					foreach (var candidateType in searchDocument.GetModules<ModuleDef>().SelectMany(a => a.GetTypes())) {
+						cancellationToken.ThrowIfCancellationRequested();
 						if (candidateType == targetType)
 							continue;
 						if (!TypesHierarchyHelpers.IsBaseType(targetType, candidateType, resolveTypeArguments: false))
@@ -1362,12 +1349,14 @@ namespace dnSpy.Mcp {
 				return results.ToArray();
 			});
 
-		[McpServerTool(Name = "find_interface_implementations"), Description("Finds types that implement a target interface. Prefer the assembly that defines the interface, but the tool can fall back across loaded documents.")]
+		[McpServerTool(Name = "find_interface_implementations"), Description("Finds loaded types that implement a target interface resolved only within the specified document.")]
 		public TypeRelationInfo[] FindInterfaceImplementations(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Interface type full name or short name.")] string interfaceTypeName,
 			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedCall("find_interface_implementations", $"{documentId}::{interfaceTypeName}", () => {
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => LoggedCall("find_interface_implementations", $"{documentId}::{interfaceTypeName}", () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var interfaceType = ResolveType(document, interfaceTypeName);
 				if (!interfaceType.IsInterface)
@@ -1376,6 +1365,7 @@ namespace dnSpy.Mcp {
 				var results = new List<TypeRelationInfo>();
 				foreach (var searchDocument in EnumerateDocuments(searchDocumentId)) {
 					foreach (var candidateType in searchDocument.GetModules<ModuleDef>().SelectMany(a => a.GetTypes())) {
+						cancellationToken.ThrowIfCancellationRequested();
 						if (candidateType.IsInterface)
 							continue;
 						if (!TypeImplementsInterface(candidateType, interfaceType))
@@ -1388,7 +1378,7 @@ namespace dnSpy.Mcp {
 				return results.ToArray();
 			});
 
-		[McpServerTool(Name = "find_interface_method_implementations"), Description("Finds methods that implement a target interface method. Prefer the assembly that defines the interface, but the tool can fall back across loaded documents.")]
+		[McpServerTool(Name = "find_interface_method_implementations"), Description("Finds loaded methods that implement an interface method resolved only within the specified document.")]
 		public UsageLocationInfo[] FindInterfaceMethodImplementations(
 			[Description("Document identifier. Prefer the Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Type full name or short name that owns the interface method.")] string interfaceTypeName,
@@ -1398,7 +1388,9 @@ namespace dnSpy.Mcp {
 			[Description("Optional parameter type list used to disambiguate overloads.")] string[]? parameterTypes = null,
 			[Description("Optional parameter count used to disambiguate overloads.")] int? parameterCount = null,
 			[Description("Optional document identifier to limit the search scope. When omitted, all loaded documents are searched.")] string? searchDocumentId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedCall("find_interface_method_implementations", $"{documentId}::{interfaceTypeName}::{methodName}", () => {
+			[Description("Maximum number of results to return.")] int maxResults = 200,
+			CancellationToken cancellationToken = default) => LoggedCall("find_interface_method_implementations", $"{documentId}::{interfaceTypeName}::{methodName}", () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var interfaceType = ResolveType(document, interfaceTypeName);
 				if (!interfaceType.IsInterface)
@@ -1408,6 +1400,7 @@ namespace dnSpy.Mcp {
 				var results = new List<UsageLocationInfo>();
 				foreach (var searchDocument in EnumerateDocuments(searchDocumentId)) {
 					foreach (var candidateType in searchDocument.GetModules<ModuleDef>().SelectMany(a => a.GetTypes())) {
+						cancellationToken.ThrowIfCancellationRequested();
 						if (candidateType.IsInterface)
 							continue;
 						var implementedInterfaceRef = GetImplementedInterface(candidateType, interfaceType);
@@ -1433,7 +1426,8 @@ namespace dnSpy.Mcp {
 				return results.ToArray();
 			});
 
-		UsageLocationInfo[] FindMethodUsagesCore(string toolName, string documentId, string typeName, string methodName, string? metadataToken, string? methodSignature, string[]? parameterTypes, int? parameterCount, string? searchDocumentId, int maxResults) => LoggedCall(toolName, $"{documentId}::{typeName}::{methodName}", () => {
+		UsageLocationInfo[] FindMethodUsagesCore(string toolName, string documentId, string typeName, string methodName, string? metadataToken, string? methodSignature, string[]? parameterTypes, int? parameterCount, string? searchDocumentId, int maxResults, CancellationToken cancellationToken) => LoggedCall(toolName, $"{documentId}::{typeName}::{methodName}", () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var type = ResolveType(document, typeName);
 				var method = ResolveMethod(document, type, methodName, metadataToken, methodSignature, parameterTypes, parameterCount);
@@ -1441,6 +1435,7 @@ namespace dnSpy.Mcp {
 
 				foreach (var searchDocument in EnumerateDocuments(searchDocumentId)) {
 					foreach (var candidateType in searchDocument.GetModules<ModuleDef>().SelectMany(a => a.GetTypes())) {
+						cancellationToken.ThrowIfCancellationRequested();
 						foreach (var candidateMethod in candidateType.Methods) {
 							if (!candidateMethod.HasBody)
 								continue;
@@ -1462,7 +1457,8 @@ namespace dnSpy.Mcp {
 				return results.ToArray();
 			});
 
-		DependencyInfo[] GetMethodUsesCore(string toolName, string documentId, string typeName, string methodName, string? metadataToken, string? methodSignature, string[]? parameterTypes, int? parameterCount, int maxResults) => LoggedCall(toolName, $"{documentId}::{typeName}::{methodName}", () => {
+		DependencyInfo[] GetMethodUsesCore(string toolName, string documentId, string typeName, string methodName, string? metadataToken, string? methodSignature, string[]? parameterTypes, int? parameterCount, int maxResults, CancellationToken cancellationToken) => LoggedCall(toolName, $"{documentId}::{typeName}::{methodName}", () => {
+				cancellationToken.ThrowIfCancellationRequested();
 				var document = ResolveDocument(documentId);
 				var type = ResolveType(document, typeName);
 				var method = ResolveMethod(document, type, methodName, metadataToken, methodSignature, parameterTypes, parameterCount);
@@ -1473,6 +1469,7 @@ namespace dnSpy.Mcp {
 					return Array.Empty<DependencyInfo>();
 
 				foreach (var instruction in method.Body.Instructions) {
+					cancellationToken.ThrowIfCancellationRequested();
 					if (instruction.Operand is IMethod methodRef && !methodRef.IsField)
 						AddDependency(results, seen, CreateDependencyInfoFromMethodRef(methodRef, instruction.Offset, instruction.OpCode.Name), maxResults);
 					else if (instruction.Operand is IField fieldRef && !fieldRef.IsMethod)
@@ -1504,15 +1501,9 @@ namespace dnSpy.Mcp {
 				dbgCallStackService.Frames.FramesTruncated);
 		});
 
-		[McpServerTool(Name = "get_debug_session_status"), Description("Returns the current debugger session status, including current process, thread, and active frame info.")]
-		public DebugSessionStatusResult GetDebugSessionStatusAlias() => GetDebugSessionStatus();
-
 		[McpServerTool(Name = "list_debug_processes"), Description("Lists all processes in the current debugger session.")]
 		public DebugProcessInfo[] ListDebugProcesses() => LoggedCall("list_debug_processes", string.Empty, () =>
 			dbgManager.Processes.Select(ToDebugProcessInfo).ToArray());
-
-		[McpServerTool(Name = "list_debugger_processes"), Description("Lists all processes in the current debugger session.")]
-		public DebugProcessInfo[] ListDebuggerProcesses() => ListDebugProcesses();
 
 		[McpServerTool(Name = "list_debug_modules"), Description("Lists currently loaded runtime modules in the active debugger session.")]
 		public DebugModuleInfo[] ListDebugModules(
@@ -1566,7 +1557,7 @@ namespace dnSpy.Mcp {
 				logger.GetEntries(level, maxResults).Select(a => new LogMessageInfo(a.TimestampUtc, a.Level, a.Message)).ToArray());
 
 		[McpServerTool(Name = "clear_debug_events"), Description("Clears buffered debugger events and output lines captured by the MCP server.")]
-		public ClearDebugEventsResult ClearDebugEvents() => LoggedBackgroundCall("clear_debug_events", string.Empty, () =>
+		public ClearDebugEventsResult ClearDebugEvents() => LoggedCall("clear_debug_events", string.Empty, () =>
 			new ClearDebugEventsResult(mcpServerController.ClearDebugEvents()));
 
 		[McpServerTool(Name = "get_recent_debug_events"), Description("Returns recent structured debugger events such as module loads, exceptions, output, and entry point breaks.")]
@@ -1574,47 +1565,36 @@ namespace dnSpy.Mcp {
 			[Description("Optional event kinds to include, for example ['module-loaded', 'exception-thrown'].")] string[]? eventKinds = null,
 			[Description("Only events with a sequence greater than this value are returned.")] long? afterSequence = null,
 			[Description("Optional process id to limit the results.")] int? processId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedBackgroundCall("get_recent_debug_events", string.Join(",", eventKinds ?? Array.Empty<string>()), () =>
+			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedCall("get_recent_debug_events", string.Join(",", eventKinds ?? Array.Empty<string>()), () =>
 				mcpServerController.GetRecentDebugEvents(eventKinds, maxResults, afterSequence, processId).Select(ToDebugEventInfo).ToArray());
-
-		[McpServerTool(Name = "get_recent_debugger_events"), Description("Returns recent structured debugger events such as module loads, exceptions, output, and entry point breaks.")]
-		public DebugEventInfo[] GetRecentDebuggerEvents(
-			[Description("Optional event kinds to include, for example ['module-loaded', 'exception-thrown'].")] string[]? eventKinds = null,
-			[Description("Only events with a sequence greater than this value are returned.")] long? afterSequence = null,
-			[Description("Optional process id to limit the results.")] int? processId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => GetRecentDebugEvents(eventKinds, afterSequence, processId, maxResults);
 
 		[McpServerTool(Name = "get_debug_output"), Description("Returns recent debugger output lines, including module loads, program output, and process exit messages.")]
 		public DebugOutputLine[] GetDebugOutput(
 			[Description("Only output lines with a sequence greater than this value are returned.")] long? afterSequence = null,
 			[Description("Optional process id to filter output.")] int? processId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedBackgroundCall("get_debug_output", processId?.ToString() ?? string.Empty, () =>
+			[Description("Maximum number of results to return.")] int maxResults = 200) => LoggedCall("get_debug_output", processId?.ToString() ?? string.Empty, () =>
 				mcpServerController.GetRecentDebugOutput(maxResults, processId, afterSequence).Select(a => new DebugOutputLine(a.Sequence, a.TimestampUtc, a.Message, a.ProcessId, a.ProcessName, a.ProcessFilename)).ToArray());
 
-		[McpServerTool(Name = "get_debugger_output"), Description("Returns recent debugger output lines, including module loads, program output, and process exit messages.")]
-		public DebugOutputLine[] GetDebuggerOutput(
-			[Description("Only output lines with a sequence greater than this value are returned.")] long? afterSequence = null,
-			[Description("Optional process id to filter output.")] int? processId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => GetDebugOutput(afterSequence, processId, maxResults);
-
 		[McpServerTool(Name = "wait_for_debug_event"), Description("Waits for the next debugger event after an optional sequence number.")]
-		public DebugEventWaitResult WaitForDebugEvent(
+		public Task<DebugEventWaitResult> WaitForDebugEventAsync(
 			[Description("Optional event kinds to include, for example ['entry-point-break', 'exception-thrown'].")] string[]? eventKinds = null,
 			[Description("Only events with a sequence greater than this value are considered.")] long? afterSequence = null,
 			[Description("Optional process id to limit the wait to one process.")] int? processId = null,
-			[Description("Timeout in milliseconds. Use -1 to wait indefinitely.")] int timeoutMilliseconds = 30000) => LoggedBackgroundCall("wait_for_debug_event", afterSequence?.ToString() ?? string.Empty, () => {
-				var entry = mcpServerController.WaitForDebugEvent(eventKinds, afterSequence, timeoutMilliseconds, processId);
-				return new DebugEventWaitResult(entry is null, entry is null ? null : ToDebugEventInfo(entry), entry?.Sequence ?? afterSequence ?? 0);
-			});
+			[Description("Timeout in milliseconds. Use -1 to wait indefinitely.")] int timeoutMilliseconds = 30000,
+			CancellationToken cancellationToken = default) => LoggedBackgroundCallAsync("wait_for_debug_event", afterSequence?.ToString() ?? string.Empty, async () => {
+				var result = await mcpServerController.WaitForDebugEventAsync(eventKinds, afterSequence, timeoutMilliseconds, processId, cancellationToken: cancellationToken).ConfigureAwait(false);
+				return new DebugEventWaitResult(result.Event is null, result.Event is null ? null : ToDebugEventInfo(result.Event), result.LatestSequence);
+			}, cancellationToken);
 
 		[McpServerTool(Name = "wait_for_debug_output"), Description("Waits for the next debugger output line, such as module load output, stdout/stderr, or process exit text.")]
-		public DebugEventWaitResult WaitForDebugOutput(
+		public Task<DebugEventWaitResult> WaitForDebugOutputAsync(
 			[Description("Only output lines with a sequence greater than this value are considered.")] long? afterSequence = null,
 			[Description("Optional process id to limit the wait to one process.")] int? processId = null,
-			[Description("Timeout in milliseconds. Use -1 to wait indefinitely.")] int timeoutMilliseconds = 30000) => LoggedBackgroundCall("wait_for_debug_output", afterSequence?.ToString() ?? string.Empty, () => {
-				var entry = mcpServerController.WaitForDebugEvent(eventKinds: null, afterSequence, timeoutMilliseconds, processId, outputOnly: true);
-				return new DebugEventWaitResult(entry is null, entry is null ? null : ToDebugEventInfo(entry), entry?.Sequence ?? afterSequence ?? 0);
-			});
+			[Description("Timeout in milliseconds. Use -1 to wait indefinitely.")] int timeoutMilliseconds = 30000,
+			CancellationToken cancellationToken = default) => LoggedBackgroundCallAsync("wait_for_debug_output", afterSequence?.ToString() ?? string.Empty, async () => {
+				var result = await mcpServerController.WaitForDebugEventAsync(eventKinds: null, afterSequence, timeoutMilliseconds, processId, outputOnly: true, cancellationToken).ConfigureAwait(false);
+				return new DebugEventWaitResult(result.Event is null, result.Event is null ? null : ToDebugEventInfo(result.Event), result.LatestSequence);
+			}, cancellationToken);
 
 		[McpServerTool(Name = "start_debugging"), Description("Starts debugging a program with custom launch options similar to dnSpyEx's Debug Program dialog.")]
 		public StartDebuggingResult StartDebugging(
@@ -1669,22 +1649,24 @@ namespace dnSpy.Mcp {
 				return threads;
 			});
 
-		[McpServerTool(Name = "list_debug_threads"), Description("Lists threads in the current debugger session or in a specific debugged process.")]
-		public DebugThreadInfo[] ListDebugThreads(
-			[Description("Optional process id to limit the results.")] int? processId = null,
-			[Description("Maximum number of results to return.")] int maxResults = 200) => ListThreads(processId, maxResults);
-
 		[McpServerTool(Name = "set_current_thread"), Description("Sets the current debug thread, which also changes the thread used by expression evaluation and call stack navigation.")]
 		public DebugContextSelectionResult SetCurrentThread(
 			[Description("Optional process id used when resolving a thread.")] int? processId = null,
 			[Description("Optional native thread id.")] ulong? threadId = null,
-			[Description("Optional managed thread id.")] ulong? managedThreadId = null) => LoggedCall("set_current_thread", $"pid={processId},tid={threadId},managedTid={managedThreadId}", () => {
+			[Description("Optional managed thread id.")] ulong? managedThreadId = null,
+			CancellationToken cancellationToken = default) => LoggedCall("set_current_thread", $"pid={processId},tid={threadId},managedTid={managedThreadId}", () => {
 				var thread = ResolveDebugThread(processId, threadId, managedThreadId);
 				if (thread is null)
 					return new DebugContextSelectionResult(false, "No matching debug thread is available.", null, null, null, null, null);
-				dbgManager.CurrentThread.Current = thread;
-				var activeFrame = dbgCallStackService.ActiveFrame;
-				return new DebugContextSelectionResult(true, $"Current thread set to {thread.UIName}.", ToDebugThreadInfo(thread), activeFrame is null ? null : ToCallStackFrameInfo(activeFrame), dbgCallStackService.ActiveFrameIndex, dbgCallStackService.Frames.FramesTruncated, null);
+
+				RunDebuggerMutationAndWait(() => dbgManager.CurrentThread.Current = thread, cancellationToken);
+				var currentThread = dbgManager.CurrentThread.Current;
+				if (currentThread != thread)
+					return new DebugContextSelectionResult(false, "The debug thread could not be selected. It may no longer be paused or available.", currentThread is null ? null : ToDebugThreadInfo(currentThread), null, null, null, null);
+
+				var framesInfo = dbgCallStackService.Frames;
+				var activeFrame = framesInfo.ActiveStackFrame;
+				return new DebugContextSelectionResult(true, $"Current thread set to {thread.UIName}.", ToDebugThreadInfo(thread), activeFrame is null ? null : ToCallStackFrameInfo(activeFrame), framesInfo.ActiveFrameIndex, framesInfo.FramesTruncated, null);
 			});
 
 		[McpServerTool(Name = "get_call_stack"), Description("Gets stack frames for the current thread or a specified thread.")]
@@ -1695,12 +1677,7 @@ namespace dnSpy.Mcp {
 			[Description("Maximum number of frames to return when reading a non-active thread.")] int maxFrames = 64) => LoggedCall("get_call_stack", $"pid={processId},tid={threadId},managedTid={managedThreadId}", () => {
 				var thread = ResolveDebugThread(processId, threadId, managedThreadId);
 				if (thread is null)
-					return new CallStackResult(
-						new DebugThreadInfo(0, 0, null, string.Empty, string.Empty, string.Empty, false, 0, Array.Empty<string>(), null, null),
-						-1,
-						false,
-						Array.Empty<CallStackFrameInfo>(),
-						"No active debug thread is available.");
+					throw new InvalidOperationException("No active debug thread is available.");
 
 				if (dbgCallStackService.Thread == thread) {
 					var framesInfo = dbgCallStackService.Frames;
@@ -1712,40 +1689,50 @@ namespace dnSpy.Mcp {
 				}
 
 				var frames = thread.GetFrames(Math.Max(1, maxFrames));
-				return new CallStackResult(
-					ToDebugThreadInfo(thread),
-					frames.Length == 0 ? -1 : 0,
-					false,
-					frames.Select(ToCallStackFrameInfo).ToArray());
+				try {
+					return new CallStackResult(
+						ToDebugThreadInfo(thread),
+						frames.Length == 0 ? -1 : 0,
+						false,
+						frames.Select(ToCallStackFrameInfo).ToArray());
+				}
+				finally {
+					if (frames.Length != 0)
+						dbgManager.Close(frames);
+				}
 			});
-
-		[McpServerTool(Name = "get_debug_call_stack"), Description("Gets stack frames for the current debug thread or a specified debug thread.")]
-		public CallStackResult GetDebugCallStack(
-			[Description("Optional process id used when resolving a thread.")] int? processId = null,
-			[Description("Optional native thread id.")] ulong? threadId = null,
-			[Description("Optional managed thread id.")] ulong? managedThreadId = null,
-			[Description("Maximum number of frames to return when reading a non-active thread.")] int maxFrames = 64) => GetCallStack(processId, threadId, managedThreadId, maxFrames);
 
 		[McpServerTool(Name = "set_active_call_stack_frame"), Description("Sets the active call stack frame by index. Optionally switches to another thread first.")]
 		public DebugContextSelectionResult SetActiveCallStackFrame(
 			[Description("Target frame index in the currently visible call stack.")] int frameIndex,
 			[Description("Optional process id used when resolving a thread.")] int? processId = null,
 			[Description("Optional native thread id. If provided and different from the current thread, dnSpy will switch threads first.")] ulong? threadId = null,
-			[Description("Optional managed thread id. If provided and different from the current thread, dnSpy will switch threads first.")] ulong? managedThreadId = null) => LoggedCall("set_active_call_stack_frame", $"frame={frameIndex},pid={processId},tid={threadId},managedTid={managedThreadId}", () => {
+			[Description("Optional managed thread id. If provided and different from the current thread, dnSpy will switch threads first.")] ulong? managedThreadId = null,
+			CancellationToken cancellationToken = default) => LoggedCall("set_active_call_stack_frame", $"frame={frameIndex},pid={processId},tid={threadId},managedTid={managedThreadId}", () => {
 				if (frameIndex < 0)
 					throw new InvalidOperationException("frameIndex must be >= 0.");
 				var targetThread = ResolveDebugThread(processId, threadId, managedThreadId);
-				if (targetThread is not null && dbgManager.CurrentThread.Current != targetThread)
-					dbgManager.CurrentThread.Current = targetThread;
+				RunDebuggerMutationAndWait(() => {
+					if (targetThread is not null)
+						dbgManager.CurrentThread.Current = targetThread;
+				}, cancellationToken);
 				var currentThread = dbgManager.CurrentThread.Current ?? dbgCallStackService.Thread;
 				if (currentThread is null)
 					return new DebugContextSelectionResult(false, "No active debug thread is available.", null, null, null, null, null);
+				if (targetThread is not null && currentThread != targetThread)
+					return new DebugContextSelectionResult(false, "The requested debug thread could not be selected. It may no longer be paused or available.", ToDebugThreadInfo(currentThread), null, null, null, null);
+
 				var framesInfo = dbgCallStackService.Frames;
 				if ((uint)frameIndex >= (uint)framesInfo.Frames.Count)
 					throw new InvalidOperationException($"Frame index {frameIndex} is out of range. Visible frame count: {framesInfo.Frames.Count}.");
-				dbgCallStackService.ActiveFrameIndex = frameIndex;
-				var activeFrame = dbgCallStackService.ActiveFrame;
-				return new DebugContextSelectionResult(true, $"Active frame set to index {frameIndex}.", ToDebugThreadInfo(currentThread), activeFrame is null ? null : ToCallStackFrameInfo(activeFrame), dbgCallStackService.ActiveFrameIndex, dbgCallStackService.Frames.FramesTruncated, null);
+
+				RunDebuggerMutationAndWait(() => dbgCallStackService.ActiveFrameIndex = frameIndex, cancellationToken);
+				framesInfo = dbgCallStackService.Frames;
+				var activeFrame = framesInfo.ActiveStackFrame;
+				if (framesInfo.ActiveFrameIndex != frameIndex || activeFrame is null || activeFrame.Thread != currentThread)
+					return new DebugContextSelectionResult(false, "The active frame could not be selected because the debugger state changed.", ToDebugThreadInfo(currentThread), framesInfo.ActiveStackFrame is null ? null : ToCallStackFrameInfo(framesInfo.ActiveStackFrame), framesInfo.ActiveFrameIndex, framesInfo.FramesTruncated, null);
+
+				return new DebugContextSelectionResult(true, $"Active frame set to index {frameIndex}.", ToDebugThreadInfo(currentThread), ToCallStackFrameInfo(activeFrame), framesInfo.ActiveFrameIndex, framesInfo.FramesTruncated, null);
 			});
 
 		[McpServerTool(Name = "break_all"), Description("Pauses all debugged processes.")]
@@ -1756,9 +1743,6 @@ namespace dnSpy.Mcp {
 			return new DebugControlResult("break_all", "requested", dbgManager.IsDebugging, dbgManager.IsRunning);
 		});
 
-		[McpServerTool(Name = "pause_debugged_processes"), Description("Pauses all debugged processes.")]
-		public DebugControlResult PauseDebuggedProcesses() => BreakAll();
-
 		[McpServerTool(Name = "step_into"), Description("Single-steps into the next statement on the current or specified thread.")]
 		public StepOperationResult StepInto(
 			[Description("Optional process id used when resolving a thread.")] int? processId = null,
@@ -1766,13 +1750,6 @@ namespace dnSpy.Mcp {
 			[Description("Optional managed thread id.")] ulong? managedThreadId = null,
 			[Description("When true, only the selected process executes during the step.")] bool singleProcessOnly = false) => LoggedCall("step_into", $"pid={processId},tid={threadId},managedTid={managedThreadId}", () =>
 				StepThread(processId, threadId, managedThreadId, singleProcessOnly ? DbgStepKind.StepIntoProcess : DbgStepKind.StepInto, "step_into"));
-
-		[McpServerTool(Name = "step_debug_thread_into"), Description("Single-steps into the next statement on the current or specified debug thread.")]
-		public StepOperationResult StepDebugThreadInto(
-			[Description("Optional process id used when resolving a thread.")] int? processId = null,
-			[Description("Optional native thread id.")] ulong? threadId = null,
-			[Description("Optional managed thread id.")] ulong? managedThreadId = null,
-			[Description("When true, only the selected process executes during the step.")] bool singleProcessOnly = false) => StepInto(processId, threadId, managedThreadId, singleProcessOnly);
 
 		[McpServerTool(Name = "step_over"), Description("Single-steps over the next statement on the current or specified thread.")]
 		public StepOperationResult StepOver(
@@ -1782,13 +1759,6 @@ namespace dnSpy.Mcp {
 			[Description("When true, only the selected process executes during the step.")] bool singleProcessOnly = false) => LoggedCall("step_over", $"pid={processId},tid={threadId},managedTid={managedThreadId}", () =>
 				StepThread(processId, threadId, managedThreadId, singleProcessOnly ? DbgStepKind.StepOverProcess : DbgStepKind.StepOver, "step_over"));
 
-		[McpServerTool(Name = "step_debug_thread_over"), Description("Single-steps over the next statement on the current or specified debug thread.")]
-		public StepOperationResult StepDebugThreadOver(
-			[Description("Optional process id used when resolving a thread.")] int? processId = null,
-			[Description("Optional native thread id.")] ulong? threadId = null,
-			[Description("Optional managed thread id.")] ulong? managedThreadId = null,
-			[Description("When true, only the selected process executes during the step.")] bool singleProcessOnly = false) => StepOver(processId, threadId, managedThreadId, singleProcessOnly);
-
 		[McpServerTool(Name = "step_out"), Description("Single-steps out of the current method on the current or specified thread.")]
 		public StepOperationResult StepOut(
 			[Description("Optional process id used when resolving a thread.")] int? processId = null,
@@ -1796,13 +1766,6 @@ namespace dnSpy.Mcp {
 			[Description("Optional managed thread id.")] ulong? managedThreadId = null,
 			[Description("When true, only the selected process executes during the step.")] bool singleProcessOnly = false) => LoggedCall("step_out", $"pid={processId},tid={threadId},managedTid={managedThreadId}", () =>
 				StepThread(processId, threadId, managedThreadId, singleProcessOnly ? DbgStepKind.StepOutProcess : DbgStepKind.StepOut, "step_out"));
-
-		[McpServerTool(Name = "step_debug_thread_out"), Description("Single-steps out of the current method on the current or specified debug thread.")]
-		public StepOperationResult StepDebugThreadOut(
-			[Description("Optional process id used when resolving a thread.")] int? processId = null,
-			[Description("Optional native thread id.")] ulong? threadId = null,
-			[Description("Optional managed thread id.")] ulong? managedThreadId = null,
-			[Description("When true, only the selected process executes during the step.")] bool singleProcessOnly = false) => StepOut(processId, threadId, managedThreadId, singleProcessOnly);
 
 		[McpServerTool(Name = "run_all"), Description("Continues all paused debugged processes.")]
 		public DebugControlResult RunAll() => LoggedCall("run_all", string.Empty, () => {
@@ -1812,9 +1775,6 @@ namespace dnSpy.Mcp {
 			return new DebugControlResult("run_all", "requested", dbgManager.IsDebugging, dbgManager.IsRunning);
 		});
 
-		[McpServerTool(Name = "continue_debugged_processes"), Description("Continues all paused debugged processes.")]
-		public DebugControlResult ContinueDebuggedProcesses() => RunAll();
-
 		[McpServerTool(Name = "stop_debugging"), Description("Stops debugging all processes in the current session.")]
 		public DebugControlResult StopDebugging() => LoggedCall("stop_debugging", string.Empty, () => {
 			if (!dbgManager.IsDebugging)
@@ -1823,16 +1783,13 @@ namespace dnSpy.Mcp {
 			return new DebugControlResult("stop_debugging", "requested", dbgManager.IsDebugging, dbgManager.IsRunning);
 		});
 
-		[McpServerTool(Name = "stop_debug_session"), Description("Stops debugging all processes in the current session.")]
-		public DebugControlResult StopDebugSession() => StopDebugging();
-
 		[McpServerTool(Name = "list_breakpoints"), Description("Lists all visible code breakpoints.")]
 		public BreakpointInfo[] ListBreakpoints() => LoggedCall("list_breakpoints", string.Empty, () =>
 			dbgCodeBreakpointsService.VisibleBreakpoints.Select(ToBreakpointInfo).OrderBy(a => a.Id).ToArray());
 
 		[McpServerTool(Name = "set_method_breakpoint"), Description("Sets a .NET code breakpoint on a method token and optional IL offset.")]
 		public BreakpointSetResult SetMethodBreakpoint(
-			[Description("Document identifier. File paths are auto-loaded if needed.")] string documentId,
+			[Description("Loaded document identifier. Prefer the exact Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Type full name or short name that owns the method.")] string typeName,
 			[Description("Method name.")] string methodName,
 			[Description("Optional metadata token such as 0x06001234. When provided, it takes precedence over name-based matching.")] string? metadataToken = null,
@@ -1868,7 +1825,7 @@ namespace dnSpy.Mcp {
 
 		[McpServerTool(Name = "set_entry_point_breakpoint"), Description("Sets a breakpoint on the assembly entry point of a loaded document.")]
 		public BreakpointSetResult SetEntryPointBreakpoint(
-			[Description("Document identifier. File paths are auto-loaded if needed.")] string documentId,
+			[Description("Loaded document identifier. Prefer the exact Filename returned by list_loaded_assemblies or load_assembly.")] string documentId,
 			[Description("Optional IL offset within the entry point method body.")] uint ilOffset = 0,
 			[Description("Whether the breakpoint starts enabled.")] bool isEnabled = true,
 			[Description("Optional breakpoint condition expression.")] string? condition = null,
@@ -1910,7 +1867,7 @@ namespace dnSpy.Mcp {
 			[Description("Set true to clear the current trace message.")] bool clearTrace = false,
 			[Description("If traceMessage is set, true continues execution after logging.")] bool continueAfterTrace = true,
 			[Description("Optional complete replacement for breakpoint labels.")] string[]? labels = null,
-			[Description("Set true to clear all labels.")] bool clearLabels = false) => LoggedBackgroundCall("update_breakpoint", breakpointId.ToString(), () => {
+			[Description("Set true to clear all labels.")] bool clearLabels = false) => LoggedCall("update_breakpoint", breakpointId.ToString(), () => {
 				var breakpoint = ResolveBreakpoint(breakpointId);
 				var settings = breakpoint.Settings;
 
@@ -1972,7 +1929,7 @@ namespace dnSpy.Mcp {
 			[Description("Optional exception category filter. Accepts internal names like DotNet or MDA and friendly aliases like .NET or CLR.")] string? category = null,
 			[Description("Optional substring filter matched against category, identifier, display name, description, or conditions.")] string? query = null,
 			[Description("When true, only entries that currently break when thrown are returned.")] bool onlyEnabled = false,
-			[Description("Maximum number of exception entries to return.")] int maxResults = 500) => LoggedBackgroundCall("list_exception_settings", category ?? string.Empty, () => {
+			[Description("Maximum number of exception entries to return.")] int maxResults = 500) => LoggedCall("list_exception_settings", category ?? string.Empty, () => {
 				var normalizedCategory = NormalizeExceptionCategory(category, allowEmpty: true);
 				var normalizedQuery = NormalizeQuery(query);
 				var items = dbgExceptionSettingsService.Exceptions
@@ -1996,7 +1953,7 @@ namespace dnSpy.Mcp {
 		[McpServerTool(Name = "set_all_exception_breaks"), Description("Enables or disables break-on-thrown for all exception settings in one or all categories, including category default entries and explicit exceptions.")]
 		public ExceptionSettingsUpdateResult SetAllExceptionBreaks(
 			[Description("True enables first-chance break on all targeted exceptions. False disables it.")] bool enabled,
-			[Description("Optional exception category filter. Accepts internal names like DotNet or MDA and friendly aliases like .NET or CLR.")] string? category = null) => LoggedBackgroundCall("set_all_exception_breaks", category ?? string.Empty, () => {
+			[Description("Optional exception category filter. Accepts internal names like DotNet or MDA and friendly aliases like .NET or CLR.")] string? category = null) => LoggedCall("set_all_exception_breaks", category ?? string.Empty, () => {
 				var categoryDefinitions = GetTargetExceptionCategories(category);
 				var categoryNames = new HashSet<string>(categoryDefinitions.Select(a => a.Name), StringComparer.Ordinal);
 				var snapshot = dbgExceptionSettingsService.Exceptions;
@@ -2035,20 +1992,12 @@ namespace dnSpy.Mcp {
 				return new ExceptionSettingsUpdateResult(true, $"{(enabled ? "Enabled" : "Disabled")} break-on-thrown for {updated.Length} exception setting(s).", add.Count + modify.Count, updated);
 			});
 
-		[McpServerTool(Name = "enable_all_exception_breaks"), Description("Convenience wrapper that enables break-on-thrown for all exception settings in one or all categories.")]
-		public ExceptionSettingsUpdateResult EnableAllExceptionBreaks(
-			[Description("Optional exception category filter. Accepts internal names like DotNet or MDA and friendly aliases like .NET or CLR.")] string? category = null) => SetAllExceptionBreaks(true, category);
-
-		[McpServerTool(Name = "disable_all_exception_breaks"), Description("Convenience wrapper that disables break-on-thrown for all exception settings in one or all categories.")]
-		public ExceptionSettingsUpdateResult DisableAllExceptionBreaks(
-			[Description("Optional exception category filter. Accepts internal names like DotNet or MDA and friendly aliases like .NET or CLR.")] string? category = null) => SetAllExceptionBreaks(false, category);
-
 		[McpServerTool(Name = "set_exception_break_state"), Description("Enables or disables break-on-thrown for specific exceptions by name or code, matching dnSpy's Exception Settings window semantics.")]
 		public ExceptionSettingsUpdateResult SetExceptionBreakState(
 			[Description("Exception identifiers to update. For DotNet pass full type names like System.ArgumentNullException. For code-based categories pass decimal values or 0x-prefixed hex.")] string[] exceptionIdentifiers,
 			[Description("True enables first-chance break on the specified exceptions. False disables it.")] bool enabled,
 			[Description("Exception category. Defaults to DotNet and accepts aliases like .NET or CLR.")] string? category = null,
-			[Description("When true, missing explicit entries are created when needed to enforce the requested state.")] bool createMissing = true) => LoggedBackgroundCall("set_exception_break_state", string.Join(",", exceptionIdentifiers ?? Array.Empty<string>()), () => {
+			[Description("When true, missing explicit entries are created when needed to enforce the requested state.")] bool createMissing = true) => LoggedCall("set_exception_break_state", string.Join(",", exceptionIdentifiers ?? Array.Empty<string>()), () => {
 				if (exceptionIdentifiers is null || exceptionIdentifiers.Length == 0)
 					throw new ArgumentException("At least one exception identifier must be provided.", nameof(exceptionIdentifiers));
 
@@ -2098,7 +2047,7 @@ namespace dnSpy.Mcp {
 			});
 
 		[McpServerTool(Name = "reset_exception_settings"), Description("Restores the debugger exception settings window to its default state and removes user-added exceptions.")]
-		public ExceptionSettingsUpdateResult ResetExceptionSettings() => LoggedBackgroundCall("reset_exception_settings", string.Empty, () => {
+		public ExceptionSettingsUpdateResult ResetExceptionSettings() => LoggedCall("reset_exception_settings", string.Empty, () => {
 				dbgExceptionSettingsService.Reset();
 				SpinWaitForExceptionReset(1500);
 				var updated = dbgExceptionSettingsService.Exceptions
@@ -2110,43 +2059,78 @@ namespace dnSpy.Mcp {
 				return new ExceptionSettingsUpdateResult(true, "Restored default exception settings.", updated.Length, updated);
 			});
 
-		[McpServerTool(Name = "restore_default_exception_settings"), Description("Alias of reset_exception_settings. Restores the debugger exception settings window to its default state.")]
-		public ExceptionSettingsUpdateResult RestoreDefaultExceptionSettings() => ResetExceptionSettings();
-
 		T LoggedCall<T>(string toolName, string detail, Func<T> action) {
 			var callId = Interlocked.Increment(ref nextToolCallId);
 			var detailText = string.IsNullOrWhiteSpace(detail) ? string.Empty : $" ({detail})";
 			logger.WriteLine($"MCP tool call #{callId}: {toolName}{detailText}");
 			try {
-				var result = mcpServerController.RunOnUISync(action);
+				var toolInfo = McpToolCatalog.TryGet(toolName) ?? throw new InvalidOperationException($"MCP tool '{toolName}' has no execution policy.");
+				var result = ExecuteToolAction(toolInfo, action);
 				logger.WriteLine($"MCP tool completed #{callId}: {toolName}");
 				return result;
 			}
 			catch (Exception ex) {
 				var actualException = UnwrapToolException(ex);
-				logger.WriteError($"MCP tool failed #{callId}: {toolName}{detailText}: {actualException.Message}");
-				if (!IsExpectedToolException(actualException))
-					logger.WriteException(actualException);
-				return CreateErrorResult<T>(toolName, actualException);
+				LogToolFailure(callId, toolName, detailText, actualException);
+				ThrowToolException(actualException);
+				throw new InvalidOperationException("Unreachable code.");
 			}
 		}
 
-		T LoggedBackgroundCall<T>(string toolName, string detail, Func<T> action) {
+		T ExecuteToolAction<T>(McpToolInfo toolInfo, Func<T> action) {
+			var useDocumentGate = toolInfo.DocumentAccess != McpDocumentAccess.None;
+			if (useDocumentGate)
+				documentExecutionGate.Wait();
+			try {
+				return toolInfo.RequiresUIThread ? mcpServerController.RunOnUISync(action) : action();
+			}
+			finally {
+				if (useDocumentGate)
+					documentExecutionGate.Release();
+			}
+		}
+
+		async Task<T> LoggedBackgroundCallAsync<T>(string toolName, string detail, Func<Task<T>> action, CancellationToken cancellationToken) {
 			var callId = Interlocked.Increment(ref nextToolCallId);
 			var detailText = string.IsNullOrWhiteSpace(detail) ? string.Empty : $" ({detail})";
 			logger.WriteLine($"MCP tool call #{callId}: {toolName}{detailText}");
+			var documentGateEntered = false;
 			try {
-				var result = action();
+				var toolInfo = McpToolCatalog.TryGet(toolName) ?? throw new InvalidOperationException($"MCP tool '{toolName}' has no execution policy.");
+				if (toolInfo.RequiresUIThread)
+					throw new InvalidOperationException($"Asynchronous background MCP tool '{toolName}' is configured to require the UI thread.");
+				if (toolInfo.DocumentAccess != McpDocumentAccess.None) {
+					await documentExecutionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+					documentGateEntered = true;
+				}
+				var result = await action().ConfigureAwait(false);
 				logger.WriteLine($"MCP tool completed #{callId}: {toolName}");
 				return result;
 			}
 			catch (Exception ex) {
 				var actualException = UnwrapToolException(ex);
-				logger.WriteError($"MCP tool failed #{callId}: {toolName}{detailText}: {actualException.Message}");
-				if (!IsExpectedToolException(actualException))
-					logger.WriteException(actualException);
-				return CreateErrorResult<T>(toolName, actualException);
+				LogToolFailure(callId, toolName, detailText, actualException);
+				ThrowToolException(actualException);
+				throw new InvalidOperationException("Unreachable code.");
 			}
+			finally {
+				if (documentGateEntered)
+					documentExecutionGate.Release();
+			}
+		}
+
+		void LogToolFailure(int callId, string toolName, string detailText, Exception exception) {
+			logger.WriteError($"MCP tool failed #{callId}: {toolName}{detailText}: {exception.Message}");
+			if (!IsExpectedToolException(exception) && exception is not OperationCanceledException)
+				logger.WriteException(exception);
+		}
+
+		void ThrowToolException(Exception exception) {
+			if (exception is OperationCanceledException || exception is McpException || !IsExpectedToolException(exception)) {
+				ExceptionDispatchInfo.Capture(exception).Throw();
+				throw new InvalidOperationException("Unreachable code.");
+			}
+			throw new McpException(exception.Message, exception);
 		}
 
 		Exception UnwrapToolException(Exception ex) {
@@ -2162,89 +2146,6 @@ namespace dnSpy.Mcp {
 					return ex;
 				}
 			}
-		}
-
-		T CreateErrorResult<T>(string toolName, Exception ex) {
-			var type = typeof(T);
-			var errorMessage = ex.Message;
-
-			if (type.IsArray) {
-				var elementType = type.GetElementType();
-				if (elementType is not null && TryCreateObjectErrorResult(elementType, toolName, errorMessage, out var element)) {
-					var array = Array.CreateInstance(elementType, 1);
-					array.SetValue(element, 0);
-					return (T)(object)array;
-				}
-				return (T)(object)Array.CreateInstance(type.GetElementType() ?? typeof(object), 0);
-			}
-
-			if (TryCreateObjectErrorResult(type, toolName, errorMessage, out var result))
-				return (T)result!;
-
-			return default!;
-		}
-
-		bool TryCreateObjectErrorResult(Type type, string toolName, string errorMessage, out object? result) {
-			result = null;
-			if (type == typeof(string)) {
-				result = errorMessage;
-				return true;
-			}
-
-			var constructors = type.GetConstructors(BindingFlags.Public | BindingFlags.Instance);
-			if (constructors.Length == 0)
-				return false;
-
-			var ctor = constructors.OrderByDescending(a => a.GetParameters().Length).First();
-			var parameters = ctor.GetParameters();
-			var args = new object?[parameters.Length];
-			for (int i = 0; i < parameters.Length; i++)
-				args[i] = CreateFallbackValue(parameters[i].ParameterType, parameters[i].Name, toolName, errorMessage);
-
-			result = ctor.Invoke(args);
-			return true;
-		}
-
-		object? CreateFallbackValue(Type type, string? parameterName, string toolName, string errorMessage) {
-			var name = parameterName ?? string.Empty;
-			if (string.Equals(name, "errorMessage", StringComparison.OrdinalIgnoreCase) ||
-				string.Equals(name, "message", StringComparison.OrdinalIgnoreCase) ||
-				string.Equals(name, "error", StringComparison.OrdinalIgnoreCase))
-				return errorMessage;
-			if (string.Equals(name, "action", StringComparison.OrdinalIgnoreCase))
-				return toolName;
-			if (string.Equals(name, "status", StringComparison.OrdinalIgnoreCase))
-				return "error";
-
-			var underlyingType = Nullable.GetUnderlyingType(type);
-			if (underlyingType is not null)
-				return CreateFallbackValue(underlyingType, parameterName, toolName, errorMessage);
-
-			if (type == typeof(string))
-				return string.Empty;
-			if (type == typeof(bool))
-				return false;
-			if (type == typeof(int))
-				return string.Equals(name, "activeFrameIndex", StringComparison.OrdinalIgnoreCase) ? -1 : 0;
-			if (type == typeof(long))
-				return 0L;
-			if (type == typeof(uint))
-				return 0U;
-			if (type == typeof(ulong))
-				return 0UL;
-			if (type == typeof(double))
-				return 0d;
-			if (type == typeof(Guid))
-				return Guid.Empty;
-			if (type == typeof(DateTimeOffset))
-				return DateTimeOffset.UtcNow;
-			if (type == typeof(DateTime))
-				return DateTime.UtcNow;
-			if (type.IsArray)
-				return Array.CreateInstance(type.GetElementType() ?? typeof(object), 0);
-			if (type.IsValueType)
-				return Activator.CreateInstance(type);
-			return null;
 		}
 
 		AssemblyAttributes UpdateFlag(AssemblyAttributes value, AssemblyAttributes flag, bool? enabled) {
@@ -2285,14 +2186,10 @@ namespace dnSpy.Mcp {
 			return true;
 		}
 
-		AddTypeCompilerSession CreateAddTypeCompilerSession(ModuleDef module) {
-			var provider = ResolveAddTypeCompilerProvider();
-			var compiler = provider.Create(CompilationKind.AddClass);
-			var references = new CompilerReferenceSession(module, compiler.GetRequiredAssemblyReferences(module));
+		void InitializeAddTypeCompilerSession(ModuleDef module, AddTypeCompilerSession session) {
 			var assemblyName = module.Assembly?.Name?.String ?? Path.GetFileNameWithoutExtension(module.Name) ?? "EditedAssembly";
 			var publicKey = (module.Assembly?.PublicKey as PublicKey)?.Data;
-			compiler.InitializeProject(new CompilerProjectInfo(assemblyName, publicKey, references.MetadataReferences, references, GetCompilerTargetPlatform(module)));
-			return new AddTypeCompilerSession(compiler, references);
+			session.Compiler.InitializeProject(new CompilerProjectInfo(assemblyName, publicKey, session.References.MetadataReferences, session.References, GetCompilerTargetPlatform(module)));
 		}
 
 		ILanguageCompilerProvider ResolveAddTypeCompilerProvider() {
@@ -2321,10 +2218,9 @@ namespace dnSpy.Mcp {
 			};
 		}
 
-		(CompilationResult? Result, CompilerLikeDiagnostic[] Diagnostics) CompileAddTypeSource(ModuleDef module, string sourceCode, AddTypeCompilerSession session) {
+		async Task<(CompilationResult? Result, CompilerLikeDiagnostic[] Diagnostics)> CompileAddTypeSourceAsync(AddTypeCompilerSession session, CancellationToken cancellationToken) {
 			try {
-				session.Compiler.AddDocuments(new[] { new CompilerDocumentInfo(sourceCode, "main.cs") });
-				var result = session.Compiler.CompileAsync(CancellationToken.None).GetAwaiter().GetResult();
+				var result = await session.Compiler.CompileAsync(cancellationToken).ConfigureAwait(false);
 				var diagnostics = ToCompilerLikeDiagnostics(result.Diagnostics);
 				if (!result.Success)
 					return (null, diagnostics);
@@ -2332,7 +2228,8 @@ namespace dnSpy.Mcp {
 			}
 			catch (Exception ex) {
 				var actual = UnwrapToolException(ex);
-				return (null, new[] { new CompilerLikeDiagnostic("Error", "ADDTYPE001", actual.Message) });
+				ExceptionDispatchInfo.Capture(actual).Throw();
+				throw new InvalidOperationException("Unreachable code.");
 			}
 		}
 
@@ -2368,11 +2265,13 @@ namespace dnSpy.Mcp {
 			}
 			catch (TargetInvocationException ex) {
 				var actual = UnwrapToolException(ex.InnerException ?? ex);
-				return (Array.Empty<TypeDef>(), new[] { new CompilerLikeDiagnostic("Error", "ADDTYPE002", actual.Message) }, false, actual.Message);
+				ExceptionDispatchInfo.Capture(actual).Throw();
+				throw new InvalidOperationException("Unreachable code.");
 			}
 			catch (Exception ex) {
 				var actual = UnwrapToolException(ex);
-				return (Array.Empty<TypeDef>(), new[] { new CompilerLikeDiagnostic("Error", "ADDTYPE003", actual.Message) }, false, actual.Message);
+				ExceptionDispatchInfo.Capture(actual).Throw();
+				throw new InvalidOperationException("Unreachable code.");
 			}
 		}
 
@@ -2382,19 +2281,19 @@ namespace dnSpy.Mcp {
 			if (!string.IsNullOrWhiteSpace(metadataToken)) {
 				if (!TryParseMetadataToken(metadataToken, out var rawToken))
 					throw new InvalidOperationException($"Invalid metadata token '{metadataToken}'. Expected a hex token such as 0x02000001.");
-				foreach (var module in document.GetModules<ModuleDef>()) {
-					if (module.ResolveToken(rawToken) is TypeDef type)
-						return type;
-				}
+				var matches = document.GetModules<ModuleDef>()
+					.Select(module => (Module: module, Type: module.ResolveToken(rawToken) as TypeDef))
+					.Where(a => a.Type is not null)
+					.ToArray();
+				if (matches.Length == 1)
+					return matches[0].Type!;
+				if (matches.Length > 1)
+					throw new InvalidOperationException($"Type metadata token '{metadataToken}' is ambiguous across modules in document '{document.Filename}'. Matches: {string.Join(" | ", matches.Select(a => $"{a.Type!.FullName} (module: {a.Module.Name})"))}.");
 				throw new InvalidOperationException($"Could not resolve type metadata token '{metadataToken}' in document '{document.Filename}'.");
 			}
 			if (string.IsNullOrWhiteSpace(typeName))
 				throw new ArgumentException("Either typeName or metadataToken must be provided.");
-			var comparer = StringComparer.OrdinalIgnoreCase;
-			var resolved = document.GetModules<ModuleDef>()
-				.SelectMany(a => a.GetTypes())
-				.FirstOrDefault(a => comparer.Equals(a.FullName, typeName) || comparer.Equals(a.ReflectionFullName, typeName) || comparer.Equals(a.Name, typeName));
-			return resolved ?? throw new InvalidOperationException($"Could not find type '{typeName}' in document '{document.Filename}'.");
+			return ResolveType(document, typeName);
 		}
 
 		void ExecuteAddUpdatedNodesHelper(ModuleDef module, object importer) {
@@ -2532,7 +2431,7 @@ namespace dnSpy.Mcp {
 						break;
 					}
 				}
-				catch (Exception ex) {
+				catch (Exception ex) when (IsExpectedToolException(UnwrapToolException(ex))) {
 					diagnostics.Add(new CompilerLikeDiagnostic("Error", "ILLOCAL002", UnwrapToolException(ex).Message));
 				}
 			}
@@ -2590,7 +2489,7 @@ namespace dnSpy.Mcp {
 						break;
 					}
 				}
-				catch (Exception ex) {
+				catch (Exception ex) when (IsExpectedToolException(UnwrapToolException(ex))) {
 					diagnostics.Add(new CompilerLikeDiagnostic("Error", "ILINST002", UnwrapToolException(ex).Message));
 				}
 			}
@@ -2622,7 +2521,7 @@ namespace dnSpy.Mcp {
 						break;
 					}
 				}
-				catch (Exception ex) {
+				catch (Exception ex) when (IsExpectedToolException(UnwrapToolException(ex))) {
 					diagnostics.Add(new CompilerLikeDiagnostic("Error", "ILEH002", UnwrapToolException(ex).Message));
 				}
 			}
@@ -2632,9 +2531,15 @@ namespace dnSpy.Mcp {
 			var instructions = context.Body.Instructions;
 			var instructionSet = new HashSet<Instruction>(instructions);
 			foreach (var instruction in instructions) {
+				try {
+					McpDnlibSafety.ValidateInstructionOperand(instruction.OpCode, instruction.Operand);
+				}
+				catch (InvalidOperationException ex) {
+					diagnostics.Add(new CompilerLikeDiagnostic("Error", "ILVALID009", ex.Message));
+				}
 				if (instruction.Operand is Instruction target && !instructionSet.Contains(target))
 					diagnostics.Add(new CompilerLikeDiagnostic("Error", "ILVALID001", $"Instruction '{instruction.OpCode.Name}' references a branch target that is no longer in the method body."));
-				if (instruction.Operand is Instruction[] targets && targets.Any(a => !instructionSet.Contains(a)))
+				if (instruction.Operand is IList<Instruction> targets && targets.Any(a => !instructionSet.Contains(a)))
 					diagnostics.Add(new CompilerLikeDiagnostic("Error", "ILVALID002", $"Instruction '{instruction.OpCode.Name}' references a switch target that is no longer in the method body."));
 				if (instruction.Operand is Local local && !context.Body.Variables.Contains(local))
 					diagnostics.Add(new CompilerLikeDiagnostic("Error", "ILVALID003", $"Instruction '{instruction.OpCode.Name}' references a local variable that is no longer in the locals list."));
@@ -2673,6 +2578,7 @@ namespace dnSpy.Mcp {
 		void ApplyInstructionDefinition(MethodIlPatchContext context, Instruction instruction, MethodIlInstructionDefinition definition, bool allowLabelResolution, Dictionary<string, Instruction>? labels = null) {
 			instruction.OpCode = ResolveOpCode(definition.OpCode);
 			instruction.Operand = ResolveInstructionOperand(context, instruction.OpCode, definition.Operand, labels, allowLabelResolution);
+			McpDnlibSafety.ValidateInstructionOperand(instruction.OpCode, instruction.Operand);
 		}
 
 		object? ResolveInstructionOperand(MethodIlPatchContext context, OpCode opCode, MethodIlOperandSpec? operandSpec, Dictionary<string, Instruction>? labels, bool allowLabelResolution) {
@@ -2740,7 +2646,7 @@ namespace dnSpy.Mcp {
 		object ResolveShortInlineI(OpCode opCode, MethodIlOperandSpec? operandSpec) {
 			if (operandSpec?.Int32 is not int value)
 				throw new InvalidOperationException("ShortInlineI operand requires Int32.");
-			return opCode.Code == Code.Unaligned ? (byte)value : (sbyte)value;
+			return McpDnlibSafety.CreateShortInlineIOperand(opCode, value);
 		}
 
 		object ResolveVariableOperand(MethodIlPatchContext context, MethodIlOperandSpec? operandSpec) {
@@ -2776,16 +2682,23 @@ namespace dnSpy.Mcp {
 		}
 
 		ITypeDefOrRef ResolveTypeOperand(MethodIlPatchContext context, MethodIlOperandSpec? operandSpec) {
+			if (!string.IsNullOrWhiteSpace(operandSpec?.MetadataToken)) {
+				if (!TryParseMetadataToken(operandSpec.MetadataToken!, out var rawToken))
+					throw new InvalidOperationException($"Invalid type metadata token '{operandSpec.MetadataToken}'.");
+				return McpDnlibSafety.ResolveTypeToken(context.Method.Module, rawToken);
+			}
 			var typeName = operandSpec?.TypeName ?? operandSpec?.Text;
 			if (string.IsNullOrWhiteSpace(typeName))
-				throw new InvalidOperationException("Type operand requires typeName.");
+				throw new InvalidOperationException("Type operand requires metadataToken or typeName.");
 			var type = ResolveType(context.Document, typeName!);
 			return type.Module == context.Method.Module ? type : context.Method.Module.Import(type);
 		}
 
 		IMethod ResolveMethodOperand(MethodIlPatchContext context, MethodIlOperandSpec? operandSpec) {
 			if (!string.IsNullOrWhiteSpace(operandSpec?.MetadataToken)) {
-				var method = ResolveMethodLikeByMetadataToken(context.Document, operandSpec.MetadataToken!);
+				if (!TryParseMetadataToken(operandSpec.MetadataToken!, out var rawToken))
+					throw new InvalidOperationException($"Invalid method metadata token '{operandSpec.MetadataToken}'.");
+				var method = McpDnlibSafety.ResolveMethodToken(context.Method.Module, rawToken);
 				return method.Module == context.Method.Module ? method : context.Method.Module.Import(method);
 			}
 			var declaringTypeName = operandSpec?.DeclaringTypeName ?? operandSpec?.TypeName;
@@ -2801,9 +2714,7 @@ namespace dnSpy.Mcp {
 			if (!string.IsNullOrWhiteSpace(operandSpec?.MetadataToken)) {
 				if (!TryParseMetadataToken(operandSpec.MetadataToken!, out var rawToken))
 					throw new InvalidOperationException($"Invalid field metadata token '{operandSpec.MetadataToken}'.");
-				var provider = context.Document.GetModules<ModuleDef>().Select(a => a.ResolveToken(rawToken)).OfType<IField>().FirstOrDefault();
-				if (provider is null)
-					throw new InvalidOperationException($"Could not resolve field token '{operandSpec.MetadataToken}'.");
+				var provider = McpDnlibSafety.ResolveFieldToken(context.Method.Module, rawToken);
 				return provider.Module == context.Method.Module ? provider : context.Method.Module.Import(provider);
 			}
 			var declaringTypeName = operandSpec?.DeclaringTypeName ?? operandSpec?.TypeName;
@@ -2925,8 +2836,10 @@ namespace dnSpy.Mcp {
 			foreach (var field in fields) {
 				if (field.GetValue(null) is not OpCode opCode)
 					continue;
-				if (string.Equals(opCode.Name, normalized, StringComparison.OrdinalIgnoreCase) || string.Equals(field.Name, normalized.Replace('.', '_').Replace('-', '_'), StringComparison.OrdinalIgnoreCase))
+				if (string.Equals(opCode.Name, normalized, StringComparison.OrdinalIgnoreCase) || string.Equals(field.Name, normalized.Replace('.', '_').Replace('-', '_'), StringComparison.OrdinalIgnoreCase)) {
+					McpDnlibSafety.ValidateOpCode(opCode);
 					return opCode;
+				}
 			}
 			throw new InvalidOperationException($"Unknown IL opcode '{opcodeName}'.");
 		}
@@ -3017,38 +2930,51 @@ namespace dnSpy.Mcp {
 
 		sealed class AddTypeCompilerSession : IDisposable {
 			public ILanguageCompiler Compiler { get; }
-			readonly CompilerReferenceSession references;
+			public CompilerReferenceSession References { get; }
 			public AddTypeCompilerSession(ILanguageCompiler compiler, CompilerReferenceSession references) {
 				Compiler = compiler;
-				this.references = references;
+				References = references;
 			}
 			public void Dispose() {
 				Compiler.Dispose();
-				references.Dispose();
+				References.Dispose();
 			}
 		}
 
 		unsafe sealed class CompilerReferenceSession : IDisposable, IAssemblyReferenceResolver {
 			readonly ModuleDef editedModule;
+			readonly CancellationToken cancellationToken;
 			readonly List<AllocatedCompilerMetadataReference> allocatedReferences = new List<AllocatedCompilerMetadataReference>();
 			readonly Dictionary<string, CompilerMetadataReference> assemblyReferences = new Dictionary<string, CompilerMetadataReference>(StringComparer.OrdinalIgnoreCase);
 			readonly HashSet<string> visitedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 			public CompilerMetadataReference[] MetadataReferences => allocatedReferences.Select(a => a.Reference).ToArray();
 
-			public CompilerReferenceSession(ModuleDef editedModule, IEnumerable<string> extraAssemblyReferences) {
+			public CompilerReferenceSession(ModuleDef editedModule, IEnumerable<string> extraAssemblyReferences, CancellationToken cancellationToken) {
 				this.editedModule = editedModule;
-				AddEditedModuleReference();
-				foreach (var asmRef in editedModule.GetAssemblyRefs())
-					Resolve(asmRef);
-				foreach (var extra in extraAssemblyReferences ?? Array.Empty<string>()) {
-					if (string.IsNullOrWhiteSpace(extra))
-						continue;
-					var parsed = new AssemblyNameInfo(extra.Trim());
-					Resolve(parsed.ToAssemblyRef());
+				this.cancellationToken = cancellationToken;
+					cancellationToken.ThrowIfCancellationRequested();
+				try {
+					AddEditedModuleReference();
+					foreach (var asmRef in editedModule.GetAssemblyRefs()) {
+						cancellationToken.ThrowIfCancellationRequested();
+						Resolve(asmRef);
+					}
+					foreach (var extra in extraAssemblyReferences ?? Array.Empty<string>()) {
+						cancellationToken.ThrowIfCancellationRequested();
+						if (string.IsNullOrWhiteSpace(extra))
+							continue;
+						var parsed = new AssemblyNameInfo(extra.Trim());
+						Resolve(parsed.ToAssemblyRef());
+					}
+				}
+				catch {
+					Dispose();
+					throw;
 				}
 			}
 
 			public CompilerMetadataReference? Resolve(IAssembly asmRef) {
+				cancellationToken.ThrowIfCancellationRequested();
 				var key = asmRef.FullName;
 				if (assemblyReferences.TryGetValue(key, out var existing))
 					return existing;
@@ -3070,6 +2996,7 @@ namespace dnSpy.Mcp {
 			}
 
 			CompilerMetadataReference? AddModuleReference(ModuleDef module, bool preferCurrentState) {
+				cancellationToken.ThrowIfCancellationRequested();
 				var referenceBytes = GetReferenceBytes(module, preferCurrentState, out var filename);
 				if (referenceBytes is null || referenceBytes.Length == 0)
 					return null;
@@ -3079,6 +3006,7 @@ namespace dnSpy.Mcp {
 			}
 
 			byte[]? GetReferenceBytes(ModuleDef module, bool preferCurrentState, out string? filename) {
+				cancellationToken.ThrowIfCancellationRequested();
 				filename = string.IsNullOrWhiteSpace(module.Location) ? null : module.Location;
 				if (!preferCurrentState && filename is not null && visitedFiles.Add(filename) && File.Exists(filename))
 					return File.ReadAllBytes(filename);
@@ -3473,16 +3401,17 @@ namespace dnSpy.Mcp {
 			case "AssemblyInformationalVersion":
 			case "AssemblyDefaultAlias":
 			case "NeutralResourcesLanguage":
-				return TryApplyAssemblyCustomAttributeByName(document, asm, attributeName, args, diagnostics);
+				return TryApplyAssemblyCustomAttributeByName(asm, attributeName, args, diagnostics);
 			case "AssemblyMetadata":
-				return TryApplyAssemblyCustomAttributeByName(document, asm, attributeName, args, diagnostics);
+				return TryApplyAssemblyCustomAttributeByName(asm, attributeName, args, diagnostics);
 			default:
-				return TryApplyAssemblyCustomAttributeByName(document, asm, attributeName, args, diagnostics);
+				return TryApplyAssemblyCustomAttributeByName(asm, attributeName, args, diagnostics);
 			}
 		}
 
-		bool TryApplyAssemblyCustomAttributeByName(IDsDocument document, AssemblyDef asm, string attributeName, string[] args, List<CompilerLikeDiagnostic> diagnostics) {
-			var ctor = ResolveAttributeConstructorByName(document, attributeName, args.Length);
+		bool TryApplyAssemblyCustomAttributeByName(AssemblyDef asm, string attributeName, string[] args, List<CompilerLikeDiagnostic> diagnostics) {
+			var targetModule = asm.ManifestModule ?? throw new InvalidOperationException($"Assembly '{asm.FullName}' does not have a manifest module.");
+			var ctor = CreateAttributeConstructorResolver(targetModule).ResolveByName(attributeName, args.Length);
 			if (ctor is null) {
 				diagnostics.Add(new CompilerLikeDiagnostic("Warning", "ASMED_CS_UNSUPPORTED", $"Unsupported or unresolved assembly attribute '{attributeName}'."));
 				return false;
@@ -3502,40 +3431,15 @@ namespace dnSpy.Mcp {
 			return true;
 		}
 
-		IMethodDefOrRef? ResolveAttributeConstructorByName(IDsDocument document, string attributeName, int parameterCount) {
-			var normalized = attributeName.Trim();
-			var normalizedWithSuffix = normalized.EndsWith("Attribute", StringComparison.Ordinal) ? normalized : normalized + "Attribute";
-			var candidates = new[] { normalized, normalizedWithSuffix };
-
-			foreach (var module in documentService.GetDocuments().SelectMany(a => a.GetModules<ModuleDef>())) {
-				foreach (var type in module.GetTypes()) {
-					if (!candidates.Any(c => string.Equals(type.FullName, c, StringComparison.OrdinalIgnoreCase) || string.Equals(type.Name, c, StringComparison.OrdinalIgnoreCase)))
-						continue;
-					var ctor = type.Methods.FirstOrDefault(m => string.Equals(m.Name, ".ctor", StringComparison.Ordinal) && GetVisibleParameterCount(m) == parameterCount);
-					if (ctor is not null)
-						return ctor;
-				}
-			}
-
-			return null;
-		}
-
-		IMethodDefOrRef ResolveMethodLikeByMetadataToken(IDsDocument document, string metadataToken) {
+		IMethodDefOrRef ResolveAttributeConstructorByMetadataToken(ModuleDef targetModule, string metadataToken) {
 			if (!TryParseMetadataToken(metadataToken, out var rawToken))
 				throw new InvalidOperationException($"Invalid metadata token '{metadataToken}'. Expected a hex token such as 0x06001234 or 0x0A001234.");
-
-			foreach (var module in document.GetModules<ModuleDef>()) {
-				if (module.ResolveToken(rawToken) is IMethodDefOrRef method)
-					return method;
-			}
-
-			foreach (var module in documentService.GetDocuments().SelectMany(a => a.GetModules<ModuleDef>())) {
-				if (module.ResolveToken(rawToken) is IMethodDefOrRef method)
-					return method;
-			}
-
-			throw new InvalidOperationException($"Could not resolve metadata token '{metadataToken}'.");
+			return CreateAttributeConstructorResolver(targetModule).ResolveByToken(rawToken);
 		}
+
+		McpAttributeConstructorResolver CreateAttributeConstructorResolver(ModuleDef targetModule) => new McpAttributeConstructorResolver(
+			targetModule,
+			documentService.GetDocuments().Select(document => document.AssemblyDef).Where(assembly => assembly is not null).Cast<AssemblyDef>());
 
 		bool TryParseMetadataToken(string metadataToken, out uint rawToken) {
 			rawToken = 0;
@@ -3555,14 +3459,24 @@ namespace dnSpy.Mcp {
 			ex is Win32Exception ||
 			ex is FileNotFoundException ||
 			ex is DirectoryNotFoundException ||
+			ex is UnauthorizedAccessException ||
+			ex is IOException ||
+			ex is RegexMatchTimeoutException ||
+			ex is TimeoutException ||
 			ex is NotSupportedException;
+
+			AttachableProcess[] DistinctAttachableProcesses(IEnumerable<AttachableProcess> attachableProcesses) => attachableProcesses
+				.Where(IsUsableAttachableProcess)
+				.GroupBy(a => $"{a.ProcessId}|{a.RuntimeKindGuid}|{a.RuntimeName}", StringComparer.OrdinalIgnoreCase)
+				.Select(group => group.First())
+				.ToArray();
 
 			bool IsUsableAttachableProcess(AttachableProcess attachableProcess) =>
 				attachableProcess.ProcessId > 0 &&
 				!string.IsNullOrWhiteSpace(attachableProcess.Name) &&
 				!string.IsNullOrWhiteSpace(attachableProcess.RuntimeName);
 
-			AttachableProcess[] GetAttachableProcessesSafe(string[]? processNames, int[]? processIds, string[]? providerNames) {
+			async Task<AttachableProcess[]> GetAttachableProcessesSafeAsync(string[]? processNames, int[]? processIds, string[]? providerNames, CancellationToken cancellationToken) {
 				var normalizedProviderNames = providerNames?
 					.Where(a => !string.IsNullOrWhiteSpace(a))
 					.Select(a => a.Trim())
@@ -3580,12 +3494,19 @@ namespace dnSpy.Mcp {
 
 				var results = new List<AttachableProcess>();
 				Exception? lastException = null;
+				var successfulProviderCount = 0;
 				foreach (var providerName in normalizedProviderNames) {
+					cancellationToken.ThrowIfCancellationRequested();
 					try {
-						var providerResults = attachableProcessesService.GetAttachableProcessesAsync(processNames, processIds, new[] { providerName }, CancellationToken.None).GetAwaiter().GetResult();
+						var providerResults = await attachableProcessesService.GetAttachableProcessesAsync(processNames, processIds, new[] { providerName }, cancellationToken).ConfigureAwait(false);
+						successfulProviderCount++;
 						results.AddRange(providerResults);
 					}
+					catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+						throw;
+					}
 					catch (Exception ex) {
+						cancellationToken.ThrowIfCancellationRequested();
 						lastException = UnwrapToolException(ex);
 						logger.WriteError($"Attach provider '{providerName}' failed during process enumeration: {lastException.Message}");
 						if (!IsExpectedToolException(lastException))
@@ -3593,9 +3514,12 @@ namespace dnSpy.Mcp {
 					}
 				}
 
-				if (results.Count == 0 && lastException is not null)
-					logger.WriteLine("All attach providers failed or produced no attachable matches; returning an empty result set.");
+				if (successfulProviderCount == 0 && lastException is not null) {
+					ExceptionDispatchInfo.Capture(lastException).Throw();
+					throw new InvalidOperationException("Unreachable code.");
+				}
 
+				cancellationToken.ThrowIfCancellationRequested();
 				return results.ToArray();
 			}
 
@@ -3610,16 +3534,28 @@ namespace dnSpy.Mcp {
 					logger.WriteError($"Decompiler '{decompiler.UniqueNameUI}' failed for '{target}': {actualException.Message}");
 					if (!IsExpectedToolException(actualException))
 						logger.WriteException(actualException);
+					if (actualException is OperationCanceledException || !IsExpectedToolException(actualException)) {
+						ExceptionDispatchInfo.Capture(actualException).Throw();
+						throw new InvalidOperationException("Unreachable code.");
+					}
 
 					var fallbackDecompiler = ResolveFallbackDecompiler(decompiler, requestedDecompilerName);
-					if (fallbackDecompiler is null)
-						return new DecompiledTextResult(decompiler.UniqueNameUI, target, string.Empty, actualException.Message);
+					if (fallbackDecompiler is null) {
+						ExceptionDispatchInfo.Capture(actualException).Throw();
+						throw new InvalidOperationException("Unreachable code.");
+					}
 
 					var fallbackOutput = new StringBuilderDecompilerOutput();
 					try {
 						decompileAction(fallbackDecompiler, fallbackOutput);
 					}
-					catch {
+					catch (Exception fallbackException) {
+						var actualFallbackException = UnwrapToolException(fallbackException);
+						logger.WriteError($"Fallback decompiler '{fallbackDecompiler.UniqueNameUI}' failed for '{target}': {actualFallbackException.Message}");
+						if (!IsExpectedToolException(actualFallbackException) && actualFallbackException is not OperationCanceledException)
+							logger.WriteException(actualFallbackException);
+						ExceptionDispatchInfo.Capture(actualFallbackException).Throw();
+						throw new InvalidOperationException("Unreachable code.");
 					}
 					return new DecompiledTextResult(fallbackDecompiler.UniqueNameUI, target, fallbackOutput.GetText(), $"Primary decompiler '{decompiler.UniqueNameUI}' failed: {actualException.Message}");
 				}
@@ -3832,8 +3768,11 @@ namespace dnSpy.Mcp {
 		}
 
 		DbgThread? ResolveDebugThread(int? processId, ulong? threadId, ulong? managedThreadId) {
-			if (threadId is null && managedThreadId is null)
-				return dbgManager.CurrentThread.Current ?? dbgCallStackService.Thread;
+			if (threadId is null && managedThreadId is null) {
+				var currentThread = dbgManager.CurrentThread.Current ?? dbgCallStackService.Thread;
+				McpTargetResolver.ValidateCurrentDebugThreadProcess(processId, currentThread?.Process.Id);
+				return currentThread;
+			}
 			var threads = EnumerateProcesses(processId).SelectMany(a => a.Threads);
 			if (threadId is not null)
 				threads = threads.Where(a => a.Id == threadId.Value);
@@ -3858,60 +3797,24 @@ namespace dnSpy.Mcp {
 				throw new ArgumentException("Document identifier must not be empty.", nameof(documentId));
 
 			var normalizedDocumentId = documentId.Trim();
-			if (TryResolveLoadedDocument(normalizedDocumentId) is { } existingDocument)
-				return existingDocument;
-
-			if (LooksLikeExistingFilePath(normalizedDocumentId)) {
-				var fullPath = Path.GetFullPath(normalizedDocumentId);
-				var loadedDocument = documentService.TryGetOrCreate(DsDocumentInfo.CreateDocument(fullPath));
-				if (loadedDocument is not null)
-					return loadedDocument;
-			}
-
-			if (TryResolveLoadedDocument(normalizedDocumentId) is { } resolvedDocument)
-				return resolvedDocument;
-
-			throw new InvalidOperationException($"Could not find or load a document matching '{documentId}'. If this is a file path, verify that the file exists and is a valid .NET assembly or module.");
-		}
-
-		IDsDocument? TryResolveLoadedDocument(string documentId) {
-			var comparer = StringComparer.OrdinalIgnoreCase;
-			string? fileName = null;
-			try {
-				fileName = Path.GetFileName(documentId);
-			}
-			catch {
-			}
 			var documents = documentService.GetDocuments();
-			return documents.FirstOrDefault(a =>
-				comparer.Equals(a.Filename, documentId) ||
-				comparer.Equals(NormalizePath(a.Filename), NormalizePath(documentId)) ||
-				(!string.IsNullOrEmpty(fileName) && comparer.Equals(Path.GetFileName(a.Filename), fileName)) ||
-				comparer.Equals(a.GetShortName(), documentId) ||
-				comparer.Equals(a.AssemblyDef?.Name, documentId) ||
-				comparer.Equals(a.AssemblyDef?.FullName, documentId) ||
-				comparer.Equals(a.ModuleDef?.Name, documentId) ||
-				comparer.Equals(a.ModuleDef?.FullName, documentId));
-		}
+			var identities = documents.Select((document, index) => new McpDocumentIdentity(
+				index,
+				document.Filename ?? string.Empty,
+				document.GetShortName() ?? string.Empty,
+				document.AssemblyDef?.Name?.ToString() ?? string.Empty,
+				document.AssemblyDef?.FullName ?? string.Empty,
+				document.ModuleDef?.Name?.ToString() ?? string.Empty,
+				document.ModuleDef?.FullName ?? string.Empty)).ToArray();
+			var exactPathMatch = McpTargetResolver.FindDocumentByExactPath(identities, normalizedDocumentId);
+			if (exactPathMatch is not null)
+				return documents[exactPathMatch.Value];
 
-		bool LooksLikeExistingFilePath(string documentId) {
-			try {
-				return File.Exists(Path.GetFullPath(documentId));
-			}
-			catch {
-				return false;
-			}
-		}
+			var identityMatch = McpTargetResolver.FindDocumentByIdentity(identities, normalizedDocumentId);
+			if (identityMatch is not null)
+				return documents[identityMatch.Value];
 
-		string NormalizePath(string? path) {
-			if (string.IsNullOrWhiteSpace(path))
-				return string.Empty;
-			try {
-				return Path.GetFullPath(path.Trim());
-			}
-			catch {
-				return path.Trim();
-			}
+			throw new InvalidOperationException($"Could not find a loaded document matching '{documentId}'. Call load_assembly first, then pass the exact Filename returned by load_assembly or list_loaded_assemblies.");
 		}
 
 		IDecompiler ResolveDecompiler(string? decompilerName) {
@@ -3931,27 +3834,15 @@ namespace dnSpy.Mcp {
 			if (string.IsNullOrWhiteSpace(typeName))
 				throw new ArgumentException("Type name must not be empty.", nameof(typeName));
 
-			var type = ResolveTypeCore(new[] { document }, typeName);
-			if (type is not null)
-				return type;
-
-			type = ResolveTypeCore(documentService.GetDocuments().Where(a => !ReferenceEquals(a, document)), typeName);
-			return type ?? throw CreateTypeNotFoundException(document, typeName);
-		}
-
-		TypeDef? ResolveTypeCore(IEnumerable<IDsDocument> documents, string typeName) {
-			var comparer = StringComparer.OrdinalIgnoreCase;
-			foreach (var doc in documents) {
-				var type = doc.GetModules<ModuleDef>()
-					.SelectMany(a => a.GetTypes())
-					.FirstOrDefault(a =>
-						comparer.Equals(a.FullName, typeName) ||
-						comparer.Equals(a.ReflectionFullName, typeName) ||
-						comparer.Equals(a.Name, typeName));
-				if (type is not null)
-					return type;
-			}
-			return null;
+			var types = document.GetModules<ModuleDef>().SelectMany(a => a.GetTypes()).ToArray();
+			var identities = types.Select((type, index) => new McpTypeIdentity(
+				index,
+				type.Module?.Name?.ToString() ?? string.Empty,
+				type.FullName ?? string.Empty,
+				type.ReflectionFullName ?? string.Empty,
+				type.Name?.ToString() ?? string.Empty)).ToArray();
+			var match = McpTargetResolver.FindType(identities, typeName);
+			return match is null ? throw CreateTypeNotFoundException(document, typeName) : types[match.Value];
 		}
 
 		FieldDef ResolveField(TypeDef type, string fieldName) {
@@ -3959,8 +3850,18 @@ namespace dnSpy.Mcp {
 				throw new ArgumentException("Field name must not be empty.", nameof(fieldName));
 
 			var comparer = StringComparer.OrdinalIgnoreCase;
-			var field = type.Fields.FirstOrDefault(a => comparer.Equals(a.Name, fieldName) || comparer.Equals(a.FullName, fieldName));
-			return field ?? throw new InvalidOperationException($"Could not find field '{fieldName}' in type '{type.FullName}'.");
+			var normalizedFieldName = fieldName.Trim();
+			var fullNameMatches = type.Fields.Where(a => comparer.Equals(a.FullName, normalizedFieldName)).ToArray();
+			if (fullNameMatches.Length == 1)
+				return fullNameMatches[0];
+			if (fullNameMatches.Length > 1)
+				throw new InvalidOperationException($"Field full name '{fieldName}' is ambiguous in type '{type.FullName}'.");
+			var shortNameMatches = type.Fields.Where(a => comparer.Equals(a.Name, normalizedFieldName)).ToArray();
+			if (shortNameMatches.Length == 1)
+				return shortNameMatches[0];
+			if (shortNameMatches.Length > 1)
+				throw new InvalidOperationException($"Field name '{fieldName}' is ambiguous in type '{type.FullName}'. Pass the full field signature. Candidates: {string.Join(" | ", shortNameMatches.Take(10).Select(a => a.FullName))}.");
+			throw new InvalidOperationException($"Could not find field '{fieldName}' in type '{type.FullName}'.");
 		}
 
 		PropertyDef ResolveProperty(TypeDef type, string propertyName) {
@@ -3968,8 +3869,18 @@ namespace dnSpy.Mcp {
 				throw new ArgumentException("Property name must not be empty.", nameof(propertyName));
 
 			var comparer = StringComparer.OrdinalIgnoreCase;
-			var property = type.Properties.FirstOrDefault(a => comparer.Equals(a.Name, propertyName) || comparer.Equals(a.FullName, propertyName));
-			return property ?? throw new InvalidOperationException($"Could not find property '{propertyName}' in type '{type.FullName}'.");
+			var normalizedPropertyName = propertyName.Trim();
+			var fullNameMatches = type.Properties.Where(a => comparer.Equals(a.FullName, normalizedPropertyName)).ToArray();
+			if (fullNameMatches.Length == 1)
+				return fullNameMatches[0];
+			if (fullNameMatches.Length > 1)
+				throw new InvalidOperationException($"Property full name '{propertyName}' is ambiguous in type '{type.FullName}'.");
+			var shortNameMatches = type.Properties.Where(a => comparer.Equals(a.Name, normalizedPropertyName)).ToArray();
+			if (shortNameMatches.Length == 1)
+				return shortNameMatches[0];
+			if (shortNameMatches.Length > 1)
+				throw new InvalidOperationException($"Property name '{propertyName}' is ambiguous in type '{type.FullName}'. Pass the full property signature. Candidates: {string.Join(" | ", shortNameMatches.Take(10).Select(a => a.FullName))}.");
+			throw new InvalidOperationException($"Could not find property '{propertyName}' in type '{type.FullName}'.");
 		}
 
 		bool TypeImplementsInterface(TypeDef candidateType, TypeDef interfaceType) {
@@ -4037,7 +3948,7 @@ namespace dnSpy.Mcp {
 				throw new ArgumentException("Method name must not be empty.", nameof(methodName));
 
 			if (!string.IsNullOrWhiteSpace(metadataToken)) {
-				var resolvedByToken = ResolveMethodByMetadataToken(document, metadataToken!);
+				var resolvedByToken = ResolveMethodByMetadataToken(document, metadataToken!, type.Module);
 				if (resolvedByToken.DeclaringType != type)
 					throw new InvalidOperationException($"Metadata token '{metadataToken}' resolved to '{resolvedByToken.FullName}', which does not belong to type '{type.FullName}'.");
 				return resolvedByToken;
@@ -4091,15 +4002,24 @@ namespace dnSpy.Mcp {
 			}
 		}
 
-		MethodDef ResolveMethodByMetadataToken(IDsDocument document, string metadataToken) {
+		MethodDef ResolveMethodByMetadataToken(IDsDocument document, string metadataToken, ModuleDef? targetModule = null) {
 			if (!TryParseMetadataToken(metadataToken, out var rawToken))
 				throw new InvalidOperationException($"Invalid metadata token '{metadataToken}'. Expected a hex token such as 0x06001234.");
 
-			foreach (var module in document.GetModules<ModuleDef>()) {
-				if (module.ResolveToken(rawToken) is MethodDef method)
-					return method;
-			}
-			throw new InvalidOperationException($"Could not resolve metadata token '{metadataToken}' in document '{document.Filename}'.");
+			var documentModules = document.GetModules<ModuleDef>().ToArray();
+			if (targetModule is not null && !documentModules.Contains(targetModule))
+				throw new InvalidOperationException($"Target module '{targetModule.Name}' does not belong to document '{document.Filename}'.");
+			var modules = targetModule is null ? documentModules : new[] { targetModule };
+			var matches = modules
+				.Select(module => (Module: module, Method: module.ResolveToken(rawToken) as MethodDef))
+				.Where(a => a.Method is not null)
+				.ToArray();
+			if (matches.Length == 1)
+				return matches[0].Method!;
+			if (matches.Length > 1)
+				throw new InvalidOperationException($"Method metadata token '{metadataToken}' is ambiguous across modules in document '{document.Filename}'. Matches: {string.Join(" | ", matches.Select(a => $"{a.Method!.FullName} (module: {a.Module.Name})"))}.");
+			var scope = targetModule is null ? $"document '{document.Filename}'" : $"module '{targetModule.Name}'";
+			throw new InvalidOperationException($"Could not resolve metadata token '{metadataToken}' in {scope}.");
 		}
 
 		bool MethodReferencesTarget(MethodDef targetMethod, IMethod methodRef) =>
@@ -4211,7 +4131,8 @@ namespace dnSpy.Mcp {
 			return false;
 		}
 
-		UsageLocationInfo[] FindFieldAccesses(string documentId, string typeName, string fieldName, bool showWrites, string? searchDocumentId, int maxResults) => LoggedCall(showWrites ? "find_field_writes" : "find_field_reads", $"{documentId}::{typeName}::{fieldName}", () => {
+		UsageLocationInfo[] FindFieldAccesses(string documentId, string typeName, string fieldName, bool showWrites, string? searchDocumentId, int maxResults, CancellationToken cancellationToken) => LoggedCall(showWrites ? "find_field_writes" : "find_field_reads", $"{documentId}::{typeName}::{fieldName}", () => {
+			cancellationToken.ThrowIfCancellationRequested();
 			var document = ResolveDocument(documentId);
 			var type = ResolveType(document, typeName);
 			var field = ResolveField(type, fieldName);
@@ -4219,6 +4140,7 @@ namespace dnSpy.Mcp {
 
 			foreach (var searchDocument in EnumerateDocuments(searchDocumentId)) {
 				foreach (var candidateType in searchDocument.GetModules<ModuleDef>().SelectMany(a => a.GetTypes())) {
+					cancellationToken.ThrowIfCancellationRequested();
 					foreach (var candidateMethod in candidateType.Methods) {
 						if (!TryFindFieldAccessInMethod(candidateMethod, field, showWrites, out var usageKind, out var ilOffset, out var opCode))
 							continue;
@@ -4232,7 +4154,8 @@ namespace dnSpy.Mcp {
 			return results.ToArray();
 		});
 
-		UsageLocationInfo[] FindPropertyAccesses(string documentId, string typeName, string propertyName, bool isSetter, string? searchDocumentId, int maxResults) => LoggedCall(isSetter ? "find_property_writes" : "find_property_reads", $"{documentId}::{typeName}::{propertyName}", () => {
+		UsageLocationInfo[] FindPropertyAccesses(string documentId, string typeName, string propertyName, bool isSetter, string? searchDocumentId, int maxResults, CancellationToken cancellationToken) => LoggedCall(isSetter ? "find_property_writes" : "find_property_reads", $"{documentId}::{typeName}::{propertyName}", () => {
+			cancellationToken.ThrowIfCancellationRequested();
 			var document = ResolveDocument(documentId);
 			var type = ResolveType(document, typeName);
 			var property = ResolveProperty(type, propertyName);
@@ -4249,6 +4172,7 @@ namespace dnSpy.Mcp {
 				: allSearchDocuments;
 			foreach (var searchDocument in orderedSearchDocuments) {
 				foreach (var candidateType in searchDocument.GetModules<ModuleDef>().SelectMany(a => a.GetTypes())) {
+					cancellationToken.ThrowIfCancellationRequested();
 					foreach (var candidateMethod in candidateType.Methods) {
 						if (!candidateMethod.HasBody)
 							continue;
@@ -4768,9 +4692,10 @@ namespace dnSpy.Mcp {
 			}
 		}
 
-		DecompilationContext CreateDecompilationContext() => new DecompilationContext {
+		DecompilationContext CreateDecompilationContext(CancellationToken cancellationToken = default) => new DecompilationContext {
 			GetDisableAssemblyLoad = documentService.DisableAssemblyLoad,
 			AsyncMethodBodyDecompilation = false,
+			CancellationToken = cancellationToken,
 		};
 
 		string? GetTargetFramework(AssemblyDef? assembly, ModuleDef? module) {
@@ -4828,14 +4753,21 @@ namespace dnSpy.Mcp {
 			attachableProcess.Architecture.ToString(),
 			attachableProcess.OperatingSystem.ToString());
 
-		DbgEvaluationInfo? TryCreateEvaluationInfo(string? languageName, out string? errorMessage, out DbgLanguage? language, out DbgStackFrame? frame) {
+		void RunDebuggerMutationAndWait(Action action, CancellationToken cancellationToken) {
+			if (dbgManager.Dispatcher.CheckAccess())
+				throw new InvalidOperationException("Cannot synchronously wait for a debugger dispatcher mutation from the debugger dispatcher thread.");
+
+			McpDebuggerMutationCoordinator.Run(dbgManager.Dispatcher.TryBeginInvoke, action, TimeSpan.FromSeconds(30), cancellationToken);
+		}
+
+		DbgEvaluationInfo? TryCreateEvaluationInfo(string? languageName, CancellationToken cancellationToken, out string? errorMessage, out DbgLanguage? language, out DbgStackFrame? frame) {
 			language = null;
-			frame = dbgCallStackService.ActiveFrame;
-			var thread = dbgManager.CurrentThread.Current;
-			if (thread is null || frame is null) {
+			frame = dbgCallStackService.Frames.ActiveStackFrame;
+			if (frame is null || frame.IsClosed) {
 				errorMessage = "No active paused debugger frame is available.";
 				return null;
 			}
+			var thread = frame.Thread;
 
 			if (!string.IsNullOrWhiteSpace(languageName)) {
 				var normalizedLanguageName = languageName.Trim();
@@ -4850,8 +4782,8 @@ namespace dnSpy.Mcp {
 			}
 
 			errorMessage = null;
-			var context = language.CreateContext(frame, cancellationToken: CancellationToken.None);
-			return new DbgEvaluationInfo(context, frame, CancellationToken.None);
+			var context = language.CreateContext(frame, cancellationToken: cancellationToken);
+			return new DbgEvaluationInfo(context, frame, cancellationToken);
 		}
 
 		ResourceInfoResult ToResourceInfo(ModuleDef module, Resource resource) {
@@ -4923,7 +4855,7 @@ namespace dnSpy.Mcp {
 			var options = RegexOptions.Compiled;
 			if (!caseSensitive)
 				options |= RegexOptions.IgnoreCase;
-			return new Regex(pattern, options);
+			return new Regex(pattern, options, TimeSpan.FromSeconds(2));
 		}
 
 		bool IsMatch(string? value, string query, bool caseSensitive, Regex? regex) {

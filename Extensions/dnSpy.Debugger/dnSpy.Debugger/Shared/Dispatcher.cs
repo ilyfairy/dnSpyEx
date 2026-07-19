@@ -61,20 +61,23 @@ namespace dnSpy.Debugger.Shared {
 				hasShutdownStarted = true;
 		}
 
-		public void BeginInvoke(Action callback) => BeginInvoke(callback, throwIfShutdownStarted: false);
+		public void BeginInvoke(Action callback) => TryBeginInvoke(callback);
 
-		void BeginInvoke(Action callback, bool throwIfShutdownStarted) {
+		public bool TryBeginInvoke(Action callback) {
 			if (callback is null)
 				throw new ArgumentNullException(nameof(callback));
 			lock (lockObj) {
-				if (hasShutdownStarted) {
-					if (throwIfShutdownStarted)
-						throw new TaskCanceledException();
-					return;
-				}
+				if (hasShutdownStarted)
+					return false;
 				queue.Enqueue(callback);
+				queueEvent.Set();
+				return true;
 			}
-			queueEvent.Set();
+		}
+
+		void BeginInvoke(Action callback, bool throwIfShutdownStarted) {
+			if (!TryBeginInvoke(callback) && throwIfShutdownStarted)
+				throw new TaskCanceledException();
 		}
 
 		public TResult Invoke<TResult>(Func<TResult> callback) {

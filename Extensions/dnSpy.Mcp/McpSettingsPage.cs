@@ -114,7 +114,7 @@ namespace dnSpy.Mcp {
 			panel.Children.Add(CreateRow("Bearer token", tokenTextBox));
 			panel.Children.Add(CreateToolEnablementSection());
 			panel.Children.Add(new TextBlock {
-				Text = "Endpoint, bearer token, and tool enablement changes take effect after restarting the MCP server. Empty token disables HTTP authentication.",
+				Text = "Endpoint, bearer token, and tool enablement changes take effect after restarting the MCP server. Only loopback listen addresses are accepted. Use an authenticated TLS or SSH tunnel for remote access.",
 				Margin = new Thickness(0, 12, 0, 0),
 				TextWrapping = TextWrapping.Wrap,
 			});

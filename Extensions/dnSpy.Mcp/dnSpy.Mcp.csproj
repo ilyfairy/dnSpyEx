@@ -26,7 +26,7 @@
 
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.1.0" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="1.4.1" />
   </ItemGroup>
 
 </Project>

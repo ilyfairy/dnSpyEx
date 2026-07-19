@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\dnSpy.Mcp\dnSpy.Mcp.csproj" />
+    <PackageReference Include="dnlib" Version="4.5.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\dnSpy.Mcp\McpDebugEventBuffer.cs" Link="McpDebugEventBuffer.cs" />
+    <Compile Include="..\dnSpy.Mcp\McpDebuggerMutationCoordinator.cs" Link="McpDebuggerMutationCoordinator.cs" />
+    <Compile Include="..\dnSpy.Mcp\McpHttpSecurity.cs" Link="McpHttpSecurity.cs" />
+    <Compile Include="..\dnSpy.Mcp\McpTargetResolver.cs" Link="McpTargetResolver.cs" />
+    <Compile Include="..\dnSpy.Mcp\McpDnlibSafety.cs" Link="McpDnlibSafety.cs" />
+  </ItemGroup>
+
+</Project>

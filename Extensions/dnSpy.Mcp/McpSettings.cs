@@ -70,17 +70,19 @@ namespace dnSpy.Mcp {
 		public HashSet<string> GetEnabledToolNames() => new HashSet<string>(
 			EnabledToolNamesText
 				.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
-				.Select(a => a.Trim())
-				.Where(a => !string.IsNullOrWhiteSpace(a)),
+				.Select(a => McpToolCatalog.TryGet(a.Trim()))
+				.Where(a => a is not null)
+				.Select(a => a!.Name),
 				StringComparer.OrdinalIgnoreCase);
 
-		public void SetEnabledToolNames(IEnumerable<string> toolNames) =>
-			EnabledToolNamesText = string.Join(";", toolNames.Where(a => !string.IsNullOrWhiteSpace(a)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(a => a, StringComparer.OrdinalIgnoreCase));
+		public void SetEnabledToolNames(IEnumerable<string> toolNames) {
+			EnabledToolNamesText = McpToolSettingsMigration.CanonicalizeEnabledToolNames(toolNames);
+		}
 
 		public bool IsToolEnabled(string toolName) {
 			var tool = McpToolCatalog.TryGet(toolName);
 			if (tool is null)
-				return true;
+				return false;
 			return GetEnabledToolNames().Contains(tool.Name);
 		}
 
@@ -99,6 +101,8 @@ namespace dnSpy.Mcp {
 	[Export(typeof(McpSettings))]
 	sealed class McpSettingsImpl : McpSettings {
 		static readonly Guid SETTINGS_GUID = new Guid("814B96D6-8E1B-4F16-B37D-877BE6CC6D1F");
+		const string ToolPolicyVersionSettingName = "ToolPolicyVersion";
+		const int CurrentToolPolicyVersion = 1;
 
 		readonly ISettingsService settingsService;
 
@@ -111,7 +115,11 @@ namespace dnSpy.Mcp {
 			Port = section.Attribute<int?>(nameof(Port)) ?? Port;
 			RoutePath = section.Attribute<string>(nameof(RoutePath)) ?? RoutePath;
 			BearerToken = section.Attribute<string>(nameof(BearerToken)) ?? BearerToken;
-			EnabledToolNamesText = section.Attribute<string>(nameof(EnabledToolNamesText)) ?? EnabledToolNamesText;
+			var storedEnabledToolNamesText = section.Attribute<string>(nameof(EnabledToolNamesText));
+			var isCurrentToolPolicyVersion = section.Attribute<int?>(ToolPolicyVersionSettingName) == CurrentToolPolicyVersion;
+			EnabledToolNamesText = McpToolSettingsMigration.NormalizeEnabledToolNamesText(storedEnabledToolNamesText, isCurrentToolPolicyVersion);
+			section.Attribute(nameof(EnabledToolNamesText), EnabledToolNamesText);
+			section.Attribute(ToolPolicyVersionSettingName, CurrentToolPolicyVersion);
 			PropertyChanged += McpSettingsImpl_PropertyChanged;
 		}
 
@@ -122,6 +130,7 @@ namespace dnSpy.Mcp {
 			section.Attribute(nameof(RoutePath), RoutePath);
 			section.Attribute(nameof(BearerToken), BearerToken);
 			section.Attribute(nameof(EnabledToolNamesText), EnabledToolNamesText);
+			section.Attribute(ToolPolicyVersionSettingName, CurrentToolPolicyVersion);
 		}
 	}
 }

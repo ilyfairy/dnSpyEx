@@ -42,7 +42,7 @@ namespace dnSpy.Mcp {
 		static readonly Guid OutputToolWindowGuid = new Guid("90A45E97-727E-4F31-8692-06E19218D99A");
 
 		readonly object lockObj;
-		readonly object debugEventLockObj;
+		readonly McpDebugEventBuffer debugEventBuffer;
 		readonly IAppWindow appWindow;
 		readonly IDsToolWindowService toolWindowService;
 		readonly McpSettings mcpSettings;
@@ -69,13 +69,11 @@ namespace dnSpy.Mcp {
 		int statusBarVersion;
 		bool isDisposed;
 		bool isShuttingDown;
-		long nextDebugEventSequence;
-		readonly List<McpDebugEventEntry> debugEvents;
 
 		[ImportingConstructor]
 		McpServerController(IAppWindow appWindow, IDsToolWindowService toolWindowService, McpSettings mcpSettings, McpOutputLogger logger, DbgManager dbgManager, DbgCodeBreakpointsService dbgCodeBreakpointsService, DbgCodeBreakpointHitCountService dbgCodeBreakpointHitCountService, DbgCallStackService dbgCallStackService, AttachableProcessesService attachableProcessesService, DbgLanguageService dbgLanguageService, DbgDotNetBreakpointFactory dbgDotNetBreakpointFactory, DbgExceptionSettingsService dbgExceptionSettingsService, IDsDocumentService documentService, IDocumentTreeView documentTreeView, IDocumentTabService documentTabService, IDecompilerService decompilerService, [ImportMany] IEnumerable<ILanguageCompilerProvider> languageCompilerProviders, IServiceLocator serviceLocator) {
 			lockObj = new object();
-			debugEventLockObj = new object();
+			debugEventBuffer = new McpDebugEventBuffer();
 			this.appWindow = appWindow;
 			this.toolWindowService = toolWindowService;
 			this.mcpSettings = mcpSettings;
@@ -94,7 +92,6 @@ namespace dnSpy.Mcp {
 			this.decompilerService = decompilerService;
 			this.languageCompilerProviders = languageCompilerProviders.ToArray();
 			this.serviceLocator = serviceLocator;
-			debugEvents = new List<McpDebugEventEntry>();
 			state = McpServerState.Stopped;
 			appWindow.MainWindowClosed += AppWindow_MainWindowClosed;
 			dbgManager.MessageUserMessage += DbgManager_MessageUserMessage;
@@ -227,72 +224,21 @@ namespace dnSpy.Mcp {
 
 		void AppWindow_MainWindowClosed(object? sender, EventArgs e) => Shutdown(disposing: true);
 
-		public McpDebugEventEntry[] GetRecentDebugEvents(string[]? eventKinds = null, int maxResults = 200, long? afterSequence = null, int? processId = null) {
-			lock (debugEventLockObj) {
-				IEnumerable<McpDebugEventEntry> query = debugEvents;
-				if (afterSequence is not null)
-					query = query.Where(a => a.Sequence > afterSequence.Value);
-				if (processId is not null)
-					query = query.Where(a => a.ProcessId == processId.Value);
-				if (eventKinds is not null && eventKinds.Length > 0) {
-					var kinds = new HashSet<string>(eventKinds.Where(a => !string.IsNullOrWhiteSpace(a)), StringComparer.OrdinalIgnoreCase);
-					query = query.Where(a => kinds.Contains(a.Kind));
-				}
-				return query.TakeLast(Math.Max(1, maxResults)).ToArray();
-			}
-		}
+		public McpDebugEventEntry[] GetRecentDebugEvents(string[]? eventKinds = null, int maxResults = 200, long? afterSequence = null, int? processId = null) =>
+			debugEventBuffer.GetRecentEvents(eventKinds, maxResults, afterSequence, processId);
 
-		public McpDebugEventEntry[] GetRecentDebugOutput(int maxResults = 200, int? processId = null, long? afterSequence = null) {
-			lock (debugEventLockObj) {
-				IEnumerable<McpDebugEventEntry> query = debugEvents.Where(a => a.IsOutputLine);
-				if (afterSequence is not null)
-					query = query.Where(a => a.Sequence > afterSequence.Value);
-				if (processId is not null)
-					query = query.Where(a => a.ProcessId == processId.Value);
-				return query.TakeLast(Math.Max(1, maxResults)).ToArray();
-			}
-		}
+		public McpDebugEventEntry[] GetRecentDebugOutput(int maxResults = 200, int? processId = null, long? afterSequence = null) =>
+			debugEventBuffer.GetRecentOutput(maxResults, processId, afterSequence);
 
-		public int ClearDebugEvents() {
-			lock (debugEventLockObj) {
-				var count = debugEvents.Count;
-				debugEvents.Clear();
-				return count;
-			}
-		}
+		public int ClearDebugEvents() => debugEventBuffer.Clear();
 
-		public McpDebugEventEntry? WaitForDebugEvent(string[]? eventKinds, long? afterSequence, int timeoutMilliseconds, int? processId = null, bool outputOnly = false) {
-			var timeout = timeoutMilliseconds < 0 ? Timeout.Infinite : timeoutMilliseconds;
-			lock (debugEventLockObj) {
-				var match = TryFindDebugEvent(eventKinds, afterSequence, processId, outputOnly);
-				if (match is not null)
-					return match;
-
-				var startTickCount = Environment.TickCount;
-				while (true) {
-					var remaining = timeout == Timeout.Infinite ? Timeout.Infinite : Math.Max(0, timeout - unchecked(Environment.TickCount - startTickCount));
-					if (remaining == 0)
-						return null;
-					Monitor.Wait(debugEventLockObj, remaining);
-					match = TryFindDebugEvent(eventKinds, afterSequence, processId, outputOnly);
-					if (match is not null)
-						return match;
-				}
+		internal async Task<McpDebugEventWaitResult> WaitForDebugEventAsync(string[]? eventKinds, long? afterSequence, int timeoutMilliseconds, int? processId = null, bool outputOnly = false, CancellationToken cancellationToken = default) {
+			Task<McpDebugEventWaitResult> waitTask;
+			lock (lockObj) {
+				var serverCancellationToken = serverCancellationTokenSource?.Token ?? new CancellationToken(canceled: true);
+				waitTask = debugEventBuffer.WaitForEventAsync(eventKinds, afterSequence, timeoutMilliseconds, processId, outputOnly, cancellationToken, serverCancellationToken);
 			}
-		}
-
-		McpDebugEventEntry? TryFindDebugEvent(string[]? eventKinds, long? afterSequence, int? processId, bool outputOnly) {
-			var minSequence = afterSequence ?? 0;
-			IEnumerable<McpDebugEventEntry> query = debugEvents.Where(a => a.Sequence > minSequence);
-			if (processId is not null)
-				query = query.Where(a => a.ProcessId == processId.Value);
-			if (outputOnly)
-				query = query.Where(a => a.IsOutputLine);
-			if (eventKinds is not null && eventKinds.Length > 0) {
-				var kinds = new HashSet<string>(eventKinds.Where(a => !string.IsNullOrWhiteSpace(a)), StringComparer.OrdinalIgnoreCase);
-				query = query.Where(a => kinds.Contains(a.Kind));
-			}
-			return query.OrderBy(a => a.Sequence).FirstOrDefault();
+			return await waitTask.ConfigureAwait(false);
 		}
 
 		void DbgManager_MessageUserMessage(object? sender, DbgMessageUserMessageEventArgs e) =>
@@ -333,29 +279,21 @@ namespace dnSpy.Mcp {
 			RecordDebugEvent("breakpoint-hit", $"Breakpoint hit: {e.BoundBreakpoint.Breakpoint.Id}", process: e.BoundBreakpoint.Process, runtime: e.BoundBreakpoint.Runtime, thread: e.Thread, module: e.BoundBreakpoint.Module, isOutputLine: false);
 
 		void RecordDebugEvent(string kind, string message, DbgProcess? process = null, DbgRuntime? runtime = null, DbgThread? thread = null, DbgModule? module = null, bool isOutputLine = false, string severity = "info") {
-			var entry = new McpDebugEventEntry(
-				Interlocked.Increment(ref nextDebugEventSequence),
-				DateTimeOffset.UtcNow,
-				kind,
-				severity,
-				message,
-				isOutputLine,
-				process?.Id,
-				process?.Name,
-				process?.Filename,
-				runtime?.Name,
-				thread?.Id,
-				module?.Name,
-				module?.Filename,
-				module?.AppDomain?.Name);
-
-			lock (debugEventLockObj) {
-				debugEvents.Add(entry);
-				const int maxEvents = 1000;
-				if (debugEvents.Count > maxEvents)
-					debugEvents.RemoveRange(0, debugEvents.Count - maxEvents);
-				Monitor.PulseAll(debugEventLockObj);
-			}
+			debugEventBuffer.Add(sequence => new McpDebugEventEntry(
+					sequence,
+					DateTimeOffset.UtcNow,
+					kind,
+					severity,
+					message,
+					isOutputLine,
+					process?.Id,
+					process?.Name,
+					process?.Filename,
+					runtime?.Name,
+					thread?.Id,
+					module?.Name,
+					module?.Filename,
+					module?.AppDomain?.Name));
 
 			if (string.Equals(severity, "error", StringComparison.OrdinalIgnoreCase))
 				logger.WriteError($"Debugger event [{kind}]: {message}");
@@ -577,6 +515,8 @@ namespace dnSpy.Mcp {
 			var port = NormalizePort(mcpSettings.Port);
 			var routePath = NormalizeRoutePath(mcpSettings.RoutePath);
 			var bearerToken = mcpSettings.BearerToken;
+			if (!McpHttpSecurity.IsListenAddressAllowed(listenAddress))
+				throw new InvalidOperationException("The embedded MCP HTTP server only supports loopback listen addresses. Use an authenticated TLS or SSH tunnel for remote access.");
 
 			builder.WebHost.UseUrls($"http://{FormatListenAddressForUrl(listenAddress)}:{port}");
 			builder.Logging.ClearProviders();
@@ -604,27 +544,41 @@ namespace dnSpy.Mcp {
 					Version = ServerVersion,
 				};
 			})
-			.WithHttpTransport();
+			.WithHttpTransport()
+			.WithRequestFilters(filters => filters.AddCallToolFilter(McpToolResultErrorPolicy.CreateCallToolFilter()));
 			mcpServerBuilder.WithTools(CreateEnabledTools());
 
 			var app = builder.Build();
 			app.Use(async (context, next) => {
-				if (IsAuthRequiredFor(context, routePath, bearerToken) && !HasValidAuthorization(context, bearerToken))
-					return;
+				if (context.Request.Path.StartsWithSegments(routePath, StringComparison.OrdinalIgnoreCase)) {
+					if (!McpHttpSecurity.IsHostAllowed(context.Request.Host.Host, context.Request.Host.Port, context.Request.Scheme, listenAddress, port)) {
+						await RejectForbiddenRequest(context, "Invalid Host header.").ConfigureAwait(false);
+						return;
+					}
+					var origin = context.Request.Headers.Origin;
+					if (origin.Count > 1 || !McpHttpSecurity.IsOriginAllowed(origin.Count == 0 ? null : origin[0], context.Request.Host.Host, context.Request.Host.Port, context.Request.Scheme, listenAddress, port)) {
+						await RejectForbiddenRequest(context, "Invalid Origin header.").ConfigureAwait(false);
+						return;
+					}
+					if (IsAuthRequired(bearerToken) && !HasValidAuthorization(context, bearerToken))
+						return;
+				}
 				await next(context).ConfigureAwait(false);
 			});
 			app.MapMcp(routePath);
 			return app;
 		}
 
-		static bool IsAuthRequiredFor(HttpContext context, string routePath, string bearerToken) =>
-			!string.IsNullOrEmpty(bearerToken) && context.Request.Path.StartsWithSegments(routePath, StringComparison.OrdinalIgnoreCase);
+		static bool IsAuthRequired(string bearerToken) => !string.IsNullOrWhiteSpace(bearerToken);
+
+		static async Task RejectForbiddenRequest(HttpContext context, string message) {
+			context.Response.StatusCode = StatusCodes.Status403Forbidden;
+			await context.Response.WriteAsync(message, context.RequestAborted).ConfigureAwait(false);
+		}
 
 		static bool HasValidAuthorization(HttpContext context, string bearerToken) {
-			const string bearerPrefix = "Bearer ";
 			var authorization = context.Request.Headers.Authorization.ToString();
-			if (authorization.StartsWith(bearerPrefix, StringComparison.OrdinalIgnoreCase) &&
-				string.Equals(authorization.Substring(bearerPrefix.Length), bearerToken, StringComparison.Ordinal)) {
+			if (McpHttpSecurity.HasValidBearerToken(authorization, bearerToken)) {
 				return true;
 			}
 			context.Response.StatusCode = StatusCodes.Status401Unauthorized;
@@ -642,24 +596,28 @@ namespace dnSpy.Mcp {
 					var name = string.IsNullOrWhiteSpace(toolAttr.Name) ? method.Name : toolAttr.Name;
 					return mcpSettings.IsToolEnabled(name);
 				})
-				.Select(method => McpServerTool.Create(method, request => new DnSpyMcpTools(
-					this,
-					logger,
-					dbgManager,
-					dbgCodeBreakpointsService,
-					dbgCodeBreakpointHitCountService,
-					dbgCallStackService,
-					attachableProcessesService,
-					dbgLanguageService,
-					dbgDotNetBreakpointFactory,
-					dbgExceptionSettingsService,
-					documentService,
-					documentTreeView,
-					documentTabService,
-					decompilerService,
-					languageCompilerProviders,
-					serviceLocator)));
+				.Select(method => {
+					var toolAttribute = method.GetCustomAttribute<McpServerToolAttribute>()!;
+					var toolName = string.IsNullOrWhiteSpace(toolAttribute.Name) ? method.Name : toolAttribute.Name;
+					McpToolResultErrorPolicy.ValidateToolMethod(toolName, method);
+					return McpServerTool.Create(method, request => new DnSpyMcpTools(
+						this,
+						logger,
+						dbgManager,
+						dbgCodeBreakpointsService,
+						dbgCodeBreakpointHitCountService,
+						dbgCallStackService,
+						attachableProcessesService,
+						dbgLanguageService,
+						dbgDotNetBreakpointFactory,
+						dbgExceptionSettingsService,
+						documentService,
+						documentTreeView,
+						documentTabService,
+						decompilerService,
+						languageCompilerProviders,
+						serviceLocator));
+				});
 	}
 
-	public sealed record McpDebugEventEntry(long Sequence, DateTimeOffset TimestampUtc, string Kind, string Severity, string Message, bool IsOutputLine, int? ProcessId, string? ProcessName, string? ProcessFilename, string? RuntimeName, ulong? ThreadId, string? ModuleName, string? ModuleFilename, string? AppDomainName);
 }

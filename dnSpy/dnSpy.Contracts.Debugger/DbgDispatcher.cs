@@ -44,5 +44,16 @@ namespace dnSpy.Contracts.Debugger {
 		/// </summary>
 		/// <param name="callback">Code to execute</param>
 		public abstract void BeginInvoke(Action callback);
+
+		/// <summary>
+		/// Tries to execute code asynchronously on the dispatcher thread. This method returns immediately even if
+		/// it happens to be called on the dispatcher thread.
+		/// </summary>
+		/// <param name="callback">Code to execute</param>
+		/// <returns><see langword="true"/> if the callback was accepted; otherwise, <see langword="false"/></returns>
+		public virtual bool TryBeginInvoke(Action callback) {
+			BeginInvoke(callback);
+			return true;
+		}
 	}
 }
